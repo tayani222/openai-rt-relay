@@ -7,8 +7,8 @@ const KEY = process.env.OPENAI_API_KEY;
 if (!KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
 
 const app = express();
-app.get("/", (req, res) => res.send("ok"));
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/", (_, res) => res.send("ok"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -31,52 +31,28 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
-  upstream.on("open", () => {
-    console.log("upstream open");
-    // Без input_audio_sample_rate (он вызывает ошибку в новой ревизии)
-    const init = {
-      type: "session.update",
-      session: {
-        voice,
-        modalities: ["audio", "text"],
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16",
-        instructions: "Всегда отвечай по‑русски и кратко."
-      }
-    };
-    upstream.send(JSON.stringify(init));
-  });
+  const pending = [];
 
-  upstream.on("close", (code, reason) =>
-    console.log("upstream close", code, reason?.toString?.() || "")
-  );
-  upstream.on("error", (e) => console.error("upstream error", e.message));
-  client.on("close", (code, reason) =>
-    console.log("client close", code, reason?.toString?.() || "")
-  );
-  client.on("error", (e) => console.error("client error", e.message));
-
-  // Клиент -> OpenAI
   client.on("message", (data, isBinary) => {
-    if (upstream.readyState !== WebSocket.OPEN) return;
-    if (isBinary) {
-      upstream.send(data, { binary: true });
-    } else {
-      const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
-      upstream.send(text, { binary: false });
+    const out = isBinary
+      ? data
+      : Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+    if (upstream.readyState !== WebSocket.OPEN) {
+      pending.push({ data: out, isBinary });
+      return;
     }
+    upstream.send(out, { binary: isBinary });
   });
 
-  // OpenAI -> Клиент (ВАЖНО: JSON отправляем как текст, не как бинарь)
   upstream.on("message", (data, isBinary) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
     if (!isBinary) {
-      const text = typeof data === "string" ? data : Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
+      const text = typeof data === "string" ? data :
+                   Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       client.send(text, { binary: false });
       return;
     }
-
     const maybeText = Buffer.isBuffer(data) ? data.toString("utf8") : "";
     if (maybeText.startsWith("{") || maybeText.startsWith("[")) {
       client.send(maybeText, { binary: false });
@@ -85,14 +61,32 @@ wss.on("connection", (client, req) => {
     }
   });
 
+  upstream.on("open", () => {
+    console.log("upstream open");
+    const init = {
+      type: "session.update",
+      session: {
+        voice,
+        modalities: ["audio", "text"],
+        input_audio_format: "pcm16",
+        output_audio_format: "pcm16"
+      }
+    };
+    upstream.send(JSON.stringify(init));
+
+    for (const m of pending) upstream.send(m.data, { binary: m.isBinary });
+    pending.length = 0;
+  });
+
   const closeBoth = () => {
     try { client.close(); } catch {}
     try { upstream.close(); } catch {}
   };
+
   client.on("close", closeBoth);
-  upstream.on("close", closeBoth);
   client.on("error", closeBoth);
-  upstream.on("error", closeBoth);
+  upstream.on("close", closeBoth);
+  upstream.on("error", (e) => console.error("upstream error", e.message));
 });
 
 const PORT = process.env.PORT || 3000;
