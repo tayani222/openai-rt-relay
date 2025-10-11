@@ -18,31 +18,30 @@ wss.on("connection", (client, req) => {
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
 
-  // Добавим voice и выключим компрессию
   const upstreamUrl =
     `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}&voice=${encodeURIComponent(voice)}`;
 
   console.log("client connected", u.search);
+
   const upstream = new WebSocket(upstreamUrl, {
     headers: {
       Authorization: `Bearer ${KEY}`,
       "OpenAI-Beta": "realtime=v1",
     },
-    perMessageDeflate: false, // важно: без компрессии
+    perMessageDeflate: false,
   });
 
   upstream.on("open", () => {
     console.log("upstream open");
-    // Базовая настройка сессии (аудио 16к, голос, рус.инструкции)
+    // Без input_audio_sample_rate (он вызывает ошибку в новой ревизии)
     const init = {
       type: "session.update",
       session: {
         voice,
         modalities: ["audio", "text"],
         input_audio_format: "pcm16",
-        input_audio_sample_rate: 16000,
         output_audio_format: "pcm16",
-        instructions: "Отвечай по‑русски и кратко."
+        instructions: "Всегда отвечай по‑русски и кратко."
       }
     };
     upstream.send(JSON.stringify(init));
@@ -61,17 +60,14 @@ wss.on("connection", (client, req) => {
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
     if (isBinary) {
-      // если вдруг бинарь — просто пробрасываем как бинарь
       upstream.send(data, { binary: true });
     } else {
-      // текст шлём как текст
       const text = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       upstream.send(text, { binary: false });
     }
   });
 
-  // OpenAI -> Клиент
-  // ВАЖНО: JSON-события шлём именно текстом, а не бинарём
+  // OpenAI -> Клиент (ВАЖНО: JSON отправляем как текст, не как бинарь)
   upstream.on("message", (data, isBinary) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
@@ -81,7 +77,6 @@ wss.on("connection", (client, req) => {
       return;
     }
 
-    // Если пришло как бинарь, проверим — вдруг это на самом деле текст JSON
     const maybeText = Buffer.isBuffer(data) ? data.toString("utf8") : "";
     if (maybeText.startsWith("{") || maybeText.startsWith("[")) {
       client.send(maybeText, { binary: false });
