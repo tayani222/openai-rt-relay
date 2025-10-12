@@ -36,9 +36,10 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
-  // Копим текст по response_id
+  // копим текст по response_id
   const textByResponse = new Map();
 
+  // клиент -> OpenAI
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
 
@@ -60,6 +61,7 @@ wss.on("connection", (client, req) => {
     }
   });
 
+  // OpenAI -> клиент (+ Inworld TTS)
   upstream.on("message", async (data, isBinary) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
@@ -72,20 +74,20 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || null;
 
-    // Копим только текстовые дельты
+    // копим только текстовые дельты
     if (USE_INWORLD && rid && (type.includes("response.text.delta") || type.includes("response.output_text.delta"))) {
       const prev = textByResponse.get(rid) || "";
       textByResponse.set(rid, prev + (evt.delta || ""));
-      return;
+      return; // текст UE не нужен
     }
 
-    // Финал ответа — нарезаем и озвучиваем сегменты ≤ 2000
+    // финал ответа — нарезаем и озвучиваем сегменты ≤ 1800-2000
     if (USE_INWORLD && rid && (type === "response.done" || type === "response.completed")) {
       const fullRaw = (textByResponse.get(rid) || "").trim();
       try {
         if (fullRaw) {
-          const segments = chunkText(fullRaw, 1800); // запас под служебные поля
-          console.log(`INWORLD synth segments: ${segments.length}, totalLen=${fullRaw.length}`);
+          const segments = chunkText(fullRaw, 1800);
+          console.log(`INWORLD synth segments=${segments.length}, totalLen=${fullRaw.length}`);
           for (const seg of segments) {
             const pcm16 = await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG);
             await streamPcm16ToClient(client, pcm16);
@@ -102,7 +104,7 @@ wss.on("connection", (client, req) => {
       return;
     }
 
-    // Прочие события — проксируем
+    // проксируем прочие события
     client.send(JSON.stringify(evt), { binary: false });
   });
 
@@ -114,7 +116,7 @@ wss.on("connection", (client, req) => {
         voice,
         modalities: USE_INWORLD ? ["text"] : ["audio","text"],
         input_audio_format: "pcm16",
-        output_audio_format: USE_INWORLD ? "text" : "pcm16"
+        output_audio_format: "pcm16" // всегда валидный кодек
       }
     };
     upstream.send(JSON.stringify(init));
@@ -127,13 +129,13 @@ wss.on("connection", (client, req) => {
   upstream.on("error", (e) => console.error("upstream error:", e.message));
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // -------- INWORLD TTS --------
 async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   const payload = { text, voiceId, modelId };
-  if (lang) payload.language = lang; // если поддерживается
+  if (lang) payload.language = lang; // если их API поддерживает язык
 
   const r = await fetch(INWORLD_TTS, {
     method: "POST",
@@ -148,18 +150,19 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   const ct  = (r.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await r.arrayBuffer());
 
-  // WAV
+  // 1) WAV
   if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
     const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
   }
 
-  // JSON
+  // 2) JSON
   try {
     const txt  = buf.toString("utf8");
     const json = JSON.parse(txt);
 
+    // Ошибка от Inworld
     if (json && typeof json === "object" && ("code" in json || "message" in json)) {
       console.error("Inworld error json:", json);
       throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
@@ -212,22 +215,21 @@ function chunkText(input, max = 1800) {
 
   const out = [];
   let cur = "";
-  const parts = t.split(/(\.|\?|!|…)+\s+/); // разбиваем по концам предложений
+  const parts = t.split(/(\.|\?|!|…)+\s+/);
   for (let i = 0; i < parts.length; i++) {
     const seg = parts[i];
     if (!seg) continue;
-    if ((cur + seg).length <= max) {
+    if ((cur + (cur ? " " : "") + seg).length <= max) {
       cur += (cur ? " " : "") + seg;
     } else {
       if (cur) out.push(cur);
       if (seg.length <= max) {
         cur = seg;
       } else {
-        // очень длинное предложение — режем по словам
         const words = seg.split(/\s+/);
         let buf = "";
         for (const w of words) {
-          if ((buf + " " + w).trim().length <= max) buf = (buf ? buf + " " : "") + w;
+          if ((buf + (buf ? " " : "") + w).length <= max) buf = (buf ? buf + " " : "") + w;
           else { if (buf) out.push(buf); buf = w; }
         }
         cur = buf;
