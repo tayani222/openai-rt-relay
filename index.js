@@ -3,7 +3,6 @@ import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// Беcкрэшовый режим: логируем, не падаем
 process.on("unhandledRejection", (r) => console.error("unhandledRejection:", r));
 process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
 
@@ -14,17 +13,22 @@ if (!OPENAI_KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
 const USE_INWORLD   = process.env.USE_INWORLD === "1";
 const INWORLD_TTS   = process.env.INWORLD_TTS_URL || "https://api.inworld.ai/tts/v1/voice";
 const INWORLD_AUTH  = process.env.INWORLD_API_KEY || ""; // "Basic <base64>"
-const INWORLD_VOICE = process.env.INWORLD_VOICE || "Anastasia"; // поставьте RU-voice вашего аккаунта
+const INWORLD_VOICE = process.env.INWORLD_VOICE || "Anastasia";
 const INWORLD_MODEL = process.env.INWORLD_MODEL || "inworld-tts-1";
 const INWORLD_LANG  = process.env.INWORLD_LANG  || "ru-RU";
 
-const INWORLD_SR    = Number(process.env.INWORLD_SAMPLE_RATE || 16000); // стабильнее всего 16k
-const CHUNK_SAMPLES = Number(process.env.CHUNK_SAMPLES || 960);   // 60 мс @16k
-const PREBUFFER_MS  = Number(process.env.PREBUFFER_MS  || 240);   // стартовый буфер
-const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 800);   // сегментация текста
-const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 100); // мин. размер фразы для раннего TTS
+const INWORLD_SR    = Number(process.env.INWORLD_SAMPLE_RATE || 16000);
+const CHUNK_SAMPLES = Number(process.env.CHUNK_SAMPLES || 960);  // ~60мс @16k
+const PREBUFFER_MS  = Number(process.env.PREBUFFER_MS  || 240);
+const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 800);
+const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 100);
 
-const EARLY_TTS     = process.env.EARLY_TTS !== "0"; // по умолчанию включён ранний синтез
+const EARLY_TTS     = process.env.EARLY_TTS !== "0";       // ранний синтез (по фразам)
+const AUTO_RESPONSE = process.env.AUTO_RESPONSE !== "0";    // авто response.create после commit
+const SERVER_VAD    = process.env.SERVER_VAD === "1";       // серверная VAD
+const VAD_SIL_MS    = Number(process.env.VAD_SILENCE_MS || 800);
+const VAD_THRESH    = Number(process.env.VAD_THRESHOLD || 0.5);
+
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio"; // или "response.audio"
 const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
@@ -36,7 +40,7 @@ app.get("/", (_, res) => res.send("ok"));
 app.get("/health", (_, res) => res.json({
   ok: true, useInworld: USE_INWORLD, sr: INWORLD_SR,
   chunkSamples: CHUNK_SAMPLES, prebufferMs: PREBUFFER_MS,
-  earlyTts: EARLY_TTS, audioEventPrefix: AUDIO_EVENT_PREFIX
+  earlyTts: EARLY_TTS, autoResponse: AUTO_RESPONSE, serverVad: SERVER_VAD
 }));
 const server = http.createServer(app);
 
@@ -48,7 +52,7 @@ wss.on("connection", (client, req) => {
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
 
-  // При USE_INWORLD НЕ передаем voice в OpenAI, чтобы он не слал свой TTS
+  // При USE_INWORLD не передаём voice в OpenAI, чтобы он не шёл своим TTS
   const upstreamUrl = USE_INWORLD
     ? `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`
     : `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}&voice=${encodeURIComponent(voice)}`;
@@ -60,23 +64,44 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
-  // По response_id храним состояние синтеза/стрима
-  const byRid = new Map(); // rid -> { textPending, itemId, outputIndex, speakChain, started }
+  // Состояние на коннект
+  const byRid = new Map();                // rid -> { textPending, itemId, outputIndex, speakChain, started }
+  let awaitingResponse = false;           // чтобы не слать дублирующие response.create
+  let lastCreateTs = 0;
 
   // клиент -> OpenAI
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
+
     if (!isBinary) {
       let s = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       try {
         const obj = JSON.parse(s);
+
+        // Автоответ: после commit отправим response.create, если клиент сам не прислал
+        if (AUTO_RESPONSE && obj?.type === "input_audio_buffer.commit") {
+          if (!awaitingResponse) {
+            awaitingResponse = true;
+            lastCreateTs = Date.now();
+            try { upstream.send(JSON.stringify({ type: "response.create" })); } catch {}
+          }
+        }
+
+        // Если клиент сам шлёт response.create — помечаем
+        if (obj?.type === "response.create") {
+          awaitingResponse = true;
+          lastCreateTs = Date.now();
+        }
+
+        // При Inworld просим у OpenAI только текст
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"]; // только текст
+          obj.response.modalities = ["text"];
           delete obj.response.voice;
           delete obj.response.audio;
           s = JSON.stringify(obj);
         }
+
         upstream.send(s, { binary: false });
       } catch {
         upstream.send(s, { binary: false });
@@ -98,16 +123,21 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
-    // Отрезаем любое аудио от OpenAI
+    // Сбрасываем флаг ожидания, когда видим созданный ответ (или fail)
+    if (type === "response.created" || type === "response.failed") {
+      awaitingResponse = false;
+    }
+
+    // Отрезаем любое аудио OpenAI
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
-    // Инициализация трекера
+    // Трекер по rid
     if (USE_INWORLD && rid && !byRid.has(rid)) {
       byRid.set(rid, { textPending: "", itemId: undefined, outputIndex: 0, speakChain: Promise.resolve(), started: false });
     }
     const tracker = rid ? byRid.get(rid) : null;
 
-    // Захват item_id / output_index (и сразу «будим» тех, кто ждал)
+    // Запоминание item_id/output_index
     if (USE_INWORLD && rid && tracker) {
       if (type === "response.output_item.added" || type === "response.content.part.added") {
         const gotItemId = evt.item_id || evt.item?.id;
@@ -119,7 +149,7 @@ wss.on("connection", (client, req) => {
       }
     }
 
-    // Копим текст + ранний синтез по завершённым предложениям
+    // Копим текст + ранний синтез
     if (USE_INWORLD && rid && tracker) {
       const picked = collectTextFromEvent(evt);
       if (picked) {
@@ -131,7 +161,7 @@ wss.on("connection", (client, req) => {
 
           for (const raw of complete) {
             const seg = sanitizeSegment(raw);
-            if (!isSpeakable(seg)) continue; // игнорируем «пустые» сегменты, чтобы не падало
+            if (!isSpeakable(seg)) continue;
             tracker.speakChain = tracker.speakChain.then(async () => {
               try {
                 const pcm = FAKE_TONE
@@ -142,7 +172,7 @@ wss.on("connection", (client, req) => {
               } catch (e) {
                 console.error("speakChain synth error:", e?.message || e);
               }
-            }).catch(e => console.error("speakChain error:", e));
+            }).catch(e => console.error("speakChain chain error:", e));
           }
         }
       }
@@ -164,7 +194,6 @@ wss.on("connection", (client, req) => {
           }
 
           if (segments.length === 0 && !tracker.started) {
-            // бывает, весь ответ — «…»/кавычки и т.п.; просто не озвучиваем
             console.log("No speakable text to synth (skipping audio).");
           } else {
             for (const seg of segments) {
@@ -182,7 +211,6 @@ wss.on("connection", (client, req) => {
             }
           }
 
-          // После очереди — посылаем done
           tracker.speakChain = tracker.speakChain.then(async () => {
             client.send(JSON.stringify({
               type: `${AUDIO_EVENT_PREFIX}.done`,
@@ -195,8 +223,7 @@ wss.on("connection", (client, req) => {
       } catch (e) {
         console.error("finalize error:", e);
       } finally {
-        // Проксируем оригинальный done
-        client.send(JSON.stringify(evt));
+        client.send(JSON.stringify(evt)); // проксируем done
       }
       return;
     }
@@ -212,7 +239,14 @@ wss.on("connection", (client, req) => {
       input_audio_format: "pcm16",
       output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
     };
-    if (!USE_INWORLD) session.voice = voice; // голос OpenAI только если Inworld OFF
+    if (!USE_INWORLD) session.voice = voice;
+    if (SERVER_VAD) {
+      session.turn_detection = {
+        type: "server_vad",
+        threshold: VAD_THRESH,
+        silence_duration_ms: VAD_SIL_MS
+      };
+    }
     upstream.send(JSON.stringify({ type: "session.update", session }));
   });
 
@@ -228,24 +262,34 @@ server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 // ===== TEXT HELPERS =====
 function collectTextFromEvent(evt) {
   const type = evt?.type || "";
+
+  // 1) Дельты текста
   if (/(response\.(output_)?text\.delta)/.test(type) && typeof evt.delta === "string") return evt.delta;
+
+  // 2) Готовый текст
   if (/(response\.(output_)?text\.done)/.test(type) && typeof evt.text === "string") return evt.text;
+
+  // 3) Новый формат: response.content.part.added/delta
+  if (/^response\.content\.part\.(added|delta)$/.test(type)) {
+    // evt.part?.text или evt.delta
+    if (evt.part && typeof evt.part.text === "string") return evt.part.text;
+    if (typeof evt.delta === "string") return evt.delta;
+  }
+
+  // 4) conversation.item.created (иногда весь текст кладут туда)
   if (type === "conversation.item.created" && evt.item && Array.isArray(evt.item.content)) {
     let s = "";
-    for (const part of evt.item.content) if (part && typeof part.text === "string") s += (s ? " " : "") + part.text;
+    for (const part of evt.item.content) {
+      if (part && typeof part.text === "string") s += (s ? " " : "") + part.text;
+    }
     return s || "";
   }
+
   return "";
 }
-function sanitizeSegment(s) {
-  // убираем лишнее, нормализуем пробелы
-  return String(s).replace(/\s+/g, " ").trim();
-}
-function isSpeakable(s) {
-  // хотя бы одна буква или цифра в любом Юникоде
-  return /[\p{L}\p{N}]/u.test(s);
-}
-// ранний TTS: режем по завершённым предложениям с минимальной длиной
+function sanitizeSegment(s){ return String(s).replace(/\s+/g, " ").trim(); }
+function isSpeakable(s){ return /[\p{L}\p{N}]/u.test(s); }
+
 function cutCompleteSentences(input, minChars = 100, hardMax = 800) {
   const t = sanitizeSegment(input);
   if (!t) return { complete: [], rest: "" };
@@ -262,12 +306,9 @@ function cutCompleteSentences(input, minChars = 100, hardMax = 800) {
     }
   }
   const rest = t.slice(last).trim();
-  // если остаток слишком длинный — порежем
-  const extra = [];
   if (rest.length > hardMax) {
     const parts = chunkText(rest, hardMax);
-    extra.push(...parts.slice(0, -1));
-    return { complete: out.concat(extra), rest: parts.at(-1) || "" };
+    return { complete: out.concat(parts.slice(0, -1)), rest: parts.at(-1) || "" };
   }
   return { complete: out, rest };
 }
@@ -297,7 +338,7 @@ function chunkText(input, max = 800) {
   return out;
 }
 
-// ===== STREAM PCM (с пре-буфером) =====
+// ===== STREAM PCM =====
 async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex = 0, prebufferFirst = true) {
   const sr = INWORLD_SR;
   const bytesPerSample = 2;
@@ -328,7 +369,7 @@ async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex 
       const delay = Math.max(0, ideal - Date.now());
       await wait(delay || chunkMs);
     } else {
-      await wait(1); // набиваем буфер
+      await wait(1);
     }
     chunkIdx++;
   }
@@ -341,13 +382,12 @@ function makeSinePcm16(ms = 900, hz = 900, sr = 16000) {
   return Buffer.from(out.buffer);
 }
 
-// ===== Inworld TTS (WAV или JSON audioContent LINEAR16) =====
+// ===== Inworld TTS =====
 async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16000) {
   if (!isSpeakable(text)) throw new Error("synthesizeWithInworld: empty/unspeakable text");
 
   const payload = {
     text, voiceId, modelId, language: lang,
-    // просим несжатый PCM
     format: "wav", audioFormat: "wav", container: "wav",
     encoding: "LINEAR16", audioEncoding: "LINEAR16",
     sampleRate: targetSr, sampleRateHertz: targetSr,
@@ -369,14 +409,12 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   const ct  = (r.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await r.arrayBuffer());
 
-  // 1) WAV в теле
   if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
     const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
   }
 
-  // 2) JSON: audioContent/URL/base64
   if (ct.includes("application/json")) {
     try {
       const json = JSON.parse(buf.toString("utf8"));
@@ -439,9 +477,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
 
 // ===== WAV/Audio utils =====
 function looksLikeWav(buf) {
-  return buf.length >= 12 &&
-         buf.toString("ascii", 0, 4) === "RIFF" &&
-         buf.toString("ascii", 8, 12) === "WAVE";
+  return buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WAVE";
 }
 function parseWavPcm16(buf) {
   if (!looksLikeWav(buf)) throw new Error("Not a WAV file");
