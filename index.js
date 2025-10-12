@@ -38,6 +38,7 @@ wss.on("connection", (client, req) => {
 
   // накапливаем текст по response_id
   const textByResponse = new Map();
+  let lastRid = null;
 
   // клиент -> openai
   client.on("message", (data, isBinary) => {
@@ -49,7 +50,7 @@ wss.on("connection", (client, req) => {
         const obj = JSON.parse(s);
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"];   // у OpenAI просим только текст
+          obj.response.modalities = ["text"]; // у OpenAI просим только текст
           s = JSON.stringify(obj);
         }
         upstream.send(s, { binary: false });
@@ -73,17 +74,23 @@ wss.on("connection", (client, req) => {
 
     const type = evt?.type || "";
 
-    // копим дельты текста
-    if (USE_INWORLD && (type.includes("output_text.delta") || type.includes("text.delta"))) {
-      const rid = evt.response_id || evt.response?.id;
-      if (rid) textByResponse.set(rid, (textByResponse.get(rid) || "") + (evt.delta || ""));
-      return; // текст UE не нужен
+    // запоминаем последний response_id, если обнаружили
+    const ridNow = evt.response_id || evt.response?.id || null;
+    if (ridNow) lastRid = ridNow;
+
+    // Копим любые строковые дельты (более надёжно, чем проверять тип)
+    if (USE_INWORLD && typeof evt.delta === "string") {
+      const rid = ridNow || lastRid;
+      if (rid) {
+        textByResponse.set(rid, (textByResponse.get(rid) || "") + evt.delta);
+        return; // текст UE не нужен
+      }
     }
 
     // финал ответа: запускаем синтез и стримим в UE
     if (USE_INWORLD && (type === "response.done" || type === "response.completed")) {
-      const rid = evt.response_id || evt.response?.id;
-      const full = (rid && textByResponse.get(rid)) ? textByResponse.get(rid).trim() : "";
+      const rid = ridNow || lastRid;
+      const full = rid ? (textByResponse.get(rid) || "").trim() : "";
       try {
         if (full) {
           console.log("INWORLD synth start, len=", full.length);
@@ -101,7 +108,7 @@ wss.on("connection", (client, req) => {
       return;
     }
 
-    // проксируем прочие события
+    // проксируем прочие события (session.*, errors, и т.д.)
     client.send(JSON.stringify(evt), { binary: false });
   });
 
