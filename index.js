@@ -76,23 +76,19 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || null;
 
-    // Копим только текстовые дельты И финальный текст
-    if (USE_INWORLD && rid && /(response\.(output_)?text\.)/.test(type)) {
-      if (typeof evt.delta === "string" && evt.delta) {
+    // 1) Копим текст из любых текстовых ивентов (дельты, финальный текст, conversation.item.created)
+    if (USE_INWORLD && rid) {
+      const picked = collectTextFromEvent(evt);
+      if (picked) {
         const prev = textByResponse.get(rid) || "";
-        textByResponse.set(rid, prev + evt.delta);
-        return;
-      }
-      if (typeof evt.text === "string" && evt.text) {
-        const prev = textByResponse.get(rid) || "";
-        textByResponse.set(rid, prev + evt.text);
-        return;
+        textByResponse.set(rid, prev + picked);
+        // текст UE не нужен, не возвращаемся — проксируем событие дальше
       }
     }
 
-    // Финал ответа — нарезаем и озвучиваем сегменты ≤ ~1800 символов
+    // 2) Финал ответа — нарезаем и озвучиваем сегменты ≤ ~1800 символов
     if (USE_INWORLD && rid && (type === "response.done" || type === "response.completed")) {
-      const fullRaw = (textByResponse.get(rid) || "").trim();
+      const fullRaw = normalizeSpaces(textByResponse.get(rid) || "");
       try {
         if (fullRaw) {
           const segments = chunkText(fullRaw, 1800);
@@ -139,6 +135,28 @@ wss.on("connection", (client, req) => {
 });
 
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
+
+// ===== Collect text from any event =====
+function collectTextFromEvent(evt) {
+  const type = evt?.type || "";
+  // response.output_text.delta / response.text.delta
+  if (/(response\.(output_)?text\.delta)/.test(type) && typeof evt.delta === "string") {
+    return evt.delta;
+  }
+  // response.text.done (иногда кладет итог сразу в text)
+  if (/(response\.(output_)?text\.done)/.test(type) && typeof evt.text === "string") {
+    return evt.text;
+  }
+  // conversation.item.created: item.content[].text
+  if (type === "conversation.item.created" && evt.item && Array.isArray(evt.item.content)) {
+    let s = "";
+    for (const part of evt.item.content) {
+      if (part && typeof part.text === "string") s += (s ? " " : "") + part.text;
+    }
+    return s || "";
+  }
+  return "";
+}
 
 // ===== Inworld TTS =====
 async function synthesizeWithInworld(text, voiceId, modelId, lang) {
