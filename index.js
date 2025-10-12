@@ -3,6 +3,10 @@ import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
+// Беcкрэшовый режим: логируем, не падаем
+process.on("unhandledRejection", (r) => console.error("unhandledRejection:", r));
+process.on("uncaughtException", (e) => console.error("uncaughtException:", e));
+
 // ===== ENV =====
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
@@ -10,17 +14,17 @@ if (!OPENAI_KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
 const USE_INWORLD   = process.env.USE_INWORLD === "1";
 const INWORLD_TTS   = process.env.INWORLD_TTS_URL || "https://api.inworld.ai/tts/v1/voice";
 const INWORLD_AUTH  = process.env.INWORLD_API_KEY || ""; // "Basic <base64>"
-const INWORLD_VOICE = process.env.INWORLD_VOICE || "Anastasia"; // поставьте реальный RU-голос
+const INWORLD_VOICE = process.env.INWORLD_VOICE || "Anastasia"; // поставьте RU-voice вашего аккаунта
 const INWORLD_MODEL = process.env.INWORLD_MODEL || "inworld-tts-1";
 const INWORLD_LANG  = process.env.INWORLD_LANG  || "ru-RU";
 
-const INWORLD_SR    = Number(process.env.INWORLD_SAMPLE_RATE || 16000); // 16000 — стабильно
-const CHUNK_SAMPLES = Number(process.env.CHUNK_SAMPLES || 960);   // 960 @16k ≈ 60мс
+const INWORLD_SR    = Number(process.env.INWORLD_SAMPLE_RATE || 16000); // стабильнее всего 16k
+const CHUNK_SAMPLES = Number(process.env.CHUNK_SAMPLES || 960);   // 60 мс @16k
 const PREBUFFER_MS  = Number(process.env.PREBUFFER_MS  || 240);   // стартовый буфер
-const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 800);   // длина текстового сегмента
-const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 100); // минимальный кусок для раннего TTS
+const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 800);   // сегментация текста
+const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 100); // мин. размер фразы для раннего TTS
 
-const EARLY_TTS     = process.env.EARLY_TTS !== "0"; // 1 (по умолчанию) — синтез по фразам до response.done
+const EARLY_TTS     = process.env.EARLY_TTS !== "0"; // по умолчанию включён ранний синтез
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio"; // или "response.audio"
 const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
@@ -44,7 +48,7 @@ wss.on("connection", (client, req) => {
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
 
-  // При USE_INWORLD НЕ передаём &voice=... -> OpenAI не будет присылать своё аудио
+  // При USE_INWORLD НЕ передаем voice в OpenAI, чтобы он не слал свой TTS
   const upstreamUrl = USE_INWORLD
     ? `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}`
     : `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}&voice=${encodeURIComponent(voice)}`;
@@ -68,7 +72,7 @@ wss.on("connection", (client, req) => {
         const obj = JSON.parse(s);
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"]; // просим только текст
+          obj.response.modalities = ["text"]; // только текст
           delete obj.response.voice;
           delete obj.response.audio;
           s = JSON.stringify(obj);
@@ -94,7 +98,7 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
-    // Отрезаем любое аудио OpenAI, если используем Inworld
+    // Отрезаем любое аудио от OpenAI
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
     // Инициализация трекера
@@ -103,7 +107,7 @@ wss.on("connection", (client, req) => {
     }
     const tracker = rid ? byRid.get(rid) : null;
 
-    // Захват item_id / output_index
+    // Захват item_id / output_index (и сразу «будим» тех, кто ждал)
     if (USE_INWORLD && rid && tracker) {
       if (type === "response.output_item.added" || type === "response.content.part.added") {
         const gotItemId = evt.item_id || evt.item?.id;
@@ -115,7 +119,7 @@ wss.on("connection", (client, req) => {
       }
     }
 
-    // Копим текст + ранний синтез по законченным предложениям
+    // Копим текст + ранний синтез по завершённым предложениям
     if (USE_INWORLD && rid && tracker) {
       const picked = collectTextFromEvent(evt);
       if (picked) {
@@ -124,46 +128,61 @@ wss.on("connection", (client, req) => {
         if (EARLY_TTS) {
           const { complete, rest } = cutCompleteSentences(tracker.textPending, MIN_SENTENCE, CHUNK_TEXT_MAX);
           tracker.textPending = rest;
-          for (const seg of complete) {
-            // Синтезируем и стримим в очереди (сохраняем порядок)
+
+          for (const raw of complete) {
+            const seg = sanitizeSegment(raw);
+            if (!isSpeakable(seg)) continue; // игнорируем «пустые» сегменты, чтобы не падало
             tracker.speakChain = tracker.speakChain.then(async () => {
-              const pcm = FAKE_TONE ? makeSinePcm16(1000, 900, INWORLD_SR)
-                                    : await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
-              await waitItemId(tracker);
-              await streamPcm16ToClient(client, pcm, rid, tracker.itemId, tracker.outputIndex, !tracker.started);
-              tracker.started = true;
+              try {
+                const pcm = FAKE_TONE
+                  ? makeSinePcm16(900, 900, INWORLD_SR)
+                  : await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+                await streamPcm16ToClient(client, pcm, rid, tracker.itemId, tracker.outputIndex, !tracker.started);
+                tracker.started = true;
+              } catch (e) {
+                console.error("speakChain synth error:", e?.message || e);
+              }
             }).catch(e => console.error("speakChain error:", e));
           }
         }
       }
     }
 
-    // Финал ответа — докручиваем хвост и закрываем аудио
+    // Финал — докручиваем хвост и закрываем аудио
     if (USE_INWORLD && rid && (type === "response.done" || type === "response.completed")) {
       try {
         if (tracker) {
-          const tail = normalizeSpaces(tracker.textPending || "");
+          const tail = sanitizeSegment(tracker.textPending || "");
           tracker.textPending = "";
 
-          if (tail || !tracker.started) {
-            const segments = tail ? chunkText(tail, CHUNK_TEXT_MAX) : [];
-            if (segments.length === 0 && !tracker.started) {
-              // если текста не было дельтами (короткая фраза), синтезируем весь хвост
-              const allText = tail;
-              segments.push(allText);
+          const segments = [];
+          if (isSpeakable(tail)) {
+            for (const part of chunkText(tail, CHUNK_TEXT_MAX)) {
+              const seg = sanitizeSegment(part);
+              if (isSpeakable(seg)) segments.push(seg);
             }
+          }
+
+          if (segments.length === 0 && !tracker.started) {
+            // бывает, весь ответ — «…»/кавычки и т.п.; просто не озвучиваем
+            console.log("No speakable text to synth (skipping audio).");
+          } else {
             for (const seg of segments) {
               tracker.speakChain = tracker.speakChain.then(async () => {
-                const pcm = FAKE_TONE ? makeSinePcm16(1000, 900, INWORLD_SR)
-                                      : await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
-                await waitItemId(tracker);
-                await streamPcm16ToClient(client, pcm, rid, tracker.itemId, tracker.outputIndex, !tracker.started);
-                tracker.started = true;
+                try {
+                  const pcm = FAKE_TONE
+                    ? makeSinePcm16(900, 900, INWORLD_SR)
+                    : await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+                  await streamPcm16ToClient(client, pcm, rid, tracker.itemId, tracker.outputIndex, !tracker.started);
+                  tracker.started = true;
+                } catch (e) {
+                  console.error("final tail synth error:", e?.message || e);
+                }
               });
             }
           }
 
-          // дождаться завершения очереди и послать done
+          // После очереди — посылаем done
           tracker.speakChain = tracker.speakChain.then(async () => {
             client.send(JSON.stringify({
               type: `${AUDIO_EVENT_PREFIX}.done`,
@@ -193,7 +212,7 @@ wss.on("connection", (client, req) => {
       input_audio_format: "pcm16",
       output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
     };
-    if (!USE_INWORLD) session.voice = voice; // голос OpenAI только если Inworld выключен
+    if (!USE_INWORLD) session.voice = voice; // голос OpenAI только если Inworld OFF
     upstream.send(JSON.stringify({ type: "session.update", session }));
   });
 
@@ -206,7 +225,7 @@ wss.on("connection", (client, req) => {
 
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
-// ===== Helpers =====
+// ===== TEXT HELPERS =====
 function collectTextFromEvent(evt) {
   const type = evt?.type || "";
   if (/(response\.(output_)?text\.delta)/.test(type) && typeof evt.delta === "string") return evt.delta;
@@ -218,12 +237,18 @@ function collectTextFromEvent(evt) {
   }
   return "";
 }
-
-// Режем на законченные предложения по . ? ! … + пробел/конец, с минимальной длиной
+function sanitizeSegment(s) {
+  // убираем лишнее, нормализуем пробелы
+  return String(s).replace(/\s+/g, " ").trim();
+}
+function isSpeakable(s) {
+  // хотя бы одна буква или цифра в любом Юникоде
+  return /[\p{L}\p{N}]/u.test(s);
+}
+// ранний TTS: режем по завершённым предложениям с минимальной длиной
 function cutCompleteSentences(input, minChars = 100, hardMax = 800) {
-  const t = normalizeSpaces(input);
+  const t = sanitizeSegment(input);
   if (!t) return { complete: [], rest: "" };
-
   const out = [];
   let last = 0;
   const re = /([.!?…]+)(\s+|$)/g;
@@ -237,18 +262,17 @@ function cutCompleteSentences(input, minChars = 100, hardMax = 800) {
     }
   }
   const rest = t.slice(last).trim();
-  // если остаток слишком большой — всё равно отдаём кусками
+  // если остаток слишком длинный — порежем
   const extra = [];
   if (rest.length > hardMax) {
     const parts = chunkText(rest, hardMax);
-    extra.push(...parts.slice(0, parts.length - 1));
-    return { complete: out.concat(extra), rest: parts[parts.length - 1] || "" };
+    extra.push(...parts.slice(0, -1));
+    return { complete: out.concat(extra), rest: parts.at(-1) || "" };
   }
   return { complete: out, rest };
 }
-
 function chunkText(input, max = 800) {
-  const t = normalizeSpaces(input);
+  const t = sanitizeSegment(input);
   if (t.length <= max) return [t];
   const out = []; let cur = "";
   const parts = t.split(/(\.|\?|!|…)+\s+/);
@@ -272,15 +296,6 @@ function chunkText(input, max = 800) {
   if (cur) out.push(cur);
   return out;
 }
-function normalizeSpaces(s){ return s.replace(/\s+/g, " ").trim(); }
-
-function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
-function defer(){ let res, rej; const p = new Promise((r,j)=>{res=r;rej=j;}); return { promise:p, resolve:res, reject:rej }; }
-async function waitItemId(tracker){
-  if (tracker.itemId) return;
-  if (!tracker._idWaiter) tracker._idWaiter = defer();
-  await tracker._idWaiter.promise;
-}
 
 // ===== STREAM PCM (с пре-буфером) =====
 async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex = 0, prebufferFirst = true) {
@@ -288,8 +303,8 @@ async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex 
   const bytesPerSample = 2;
   const bytesPerChunk = CHUNK_SAMPLES * bytesPerSample;
   const chunkMs = Math.round(CHUNK_SAMPLES / sr * 1000);
-
   const burstChunks = prebufferFirst ? Math.max(0, Math.floor(PREBUFFER_MS / chunkMs)) : 0;
+
   let sent = 0;
   let chunkIdx = 0;
   const t0 = Date.now();
@@ -308,39 +323,37 @@ async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex 
       audio: chunk.toString("base64")
     }));
 
-    // ритм: вначале «набиваем» буфер, потом держим темп
     if (chunkIdx >= burstChunks) {
       const ideal = t0 + chunkIdx * chunkMs;
       const delay = Math.max(0, ideal - Date.now());
       await wait(delay || chunkMs);
     } else {
-      await wait(1);
+      await wait(1); // набиваем буфер
     }
     chunkIdx++;
   }
 }
+function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
+function makeSinePcm16(ms = 900, hz = 900, sr = 16000) {
+  const len = Math.floor(ms / 1000 * sr);
+  const out = new Int16Array(len);
+  for (let i = 0; i < len; i++) out[i] = Math.floor(32767 * Math.sin(2 * Math.PI * hz * i / sr));
+  return Buffer.from(out.buffer);
+}
 
 // ===== Inworld TTS (WAV или JSON audioContent LINEAR16) =====
 async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16000) {
-  // SSML можно пробовать через флаги, если поддерживается вашим проектом:
-  // const useSSML = process.env.INWORLD_SSML === "1";
-  // const payloadText = useSSML ? `<speak><lang xml:lang="${lang}">${escapeXml(text)}</lang></speak>` : text;
+  if (!isSpeakable(text)) throw new Error("synthesizeWithInworld: empty/unspeakable text");
 
   const payload = {
-    text, voiceId, modelId,
-    language: lang,
-    // агрессивно просим несжатый PCM/WAV
-    format: "wav",
-    audioFormat: "wav",
-    container: "wav",
-    encoding: "LINEAR16",
-    audioEncoding: "LINEAR16",
-    sampleRate: targetSr,
-    sampleRateHertz: targetSr,
+    text, voiceId, modelId, language: lang,
+    // просим несжатый PCM
+    format: "wav", audioFormat: "wav", container: "wav",
+    encoding: "LINEAR16", audioEncoding: "LINEAR16",
+    sampleRate: targetSr, sampleRateHertz: targetSr,
     channels: 1,
     audio: { format: "wav", sampleRate: targetSr, channels: 1 },
     audioConfig: { audioFormat: "wav", audioEncoding: "LINEAR16", sampleRateHertz: targetSr, channels: 1 }
-    // ...(useSSML ? { textType: "ssml", ssml: true } : {})
   };
 
   const r = await fetch(INWORLD_TTS, {
@@ -356,17 +369,18 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   const ct  = (r.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await r.arrayBuffer());
 
-  // WAV сразу
+  // 1) WAV в теле
   if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
     const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
   }
 
-  // JSON: audioContent / base64 / URL
+  // 2) JSON: audioContent/URL/base64
   if (ct.includes("application/json")) {
     try {
       const json = JSON.parse(buf.toString("utf8"));
+
       if (json && typeof json === "object" && (json.code || json.message)) {
         console.error("Inworld error json:", json);
         throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
@@ -423,7 +437,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   throw new Error("Unexpected Inworld TTS response");
 }
 
-// ===== Audio utils =====
+// ===== WAV/Audio utils =====
 function looksLikeWav(buf) {
   return buf.length >= 12 &&
          buf.toString("ascii", 0, 4) === "RIFF" &&
@@ -431,7 +445,7 @@ function looksLikeWav(buf) {
 }
 function parseWavPcm16(buf) {
   if (!looksLikeWav(buf)) throw new Error("Not a WAV file");
-  let pos = 12, sampleRate = 16000, channels = 1;
+  let pos = 12, sampleRate = 16000, channels = 1, bps = 16;
   let dataStart = -1, dataLen = 0;
   while (pos + 8 <= buf.length) {
     const id = buf.toString("ascii", pos, pos + 4);
@@ -440,7 +454,7 @@ function parseWavPcm16(buf) {
       const fmt = buf.readUInt16LE(pos + 8);
       channels = buf.readUInt16LE(pos + 10);
       sampleRate = buf.readUInt32LE(pos + 12);
-      const bps = buf.readUInt16LE(pos + 22);
+      bps = buf.readUInt16LE(pos + 22);
       if (fmt !== 1 || bps !== 16) throw new Error(`Unsupported WAV: fmt=${fmt}, bps=${bps}`);
     } else if (id === "data") { dataStart = pos + 8; dataLen = size; break; }
     pos += 8 + size + (size % 2);
@@ -472,7 +486,7 @@ function resamplePcm16(pcm16, inRate, outRate){
 function isCompressedAudio(buf){
   if (buf.length < 4) return false;
   const a = buf[0], b = buf[1], c = buf[2], d = buf[3];
-  if (a===0x49 && b===0x44 && c===0x33) return true; // ID3
+  if (a===0x49 && b===0x44 && c===0x33) return true; // "ID3"
   if (a===0xFF && (b & 0xE0) === 0xE0) return true;  // MP3 frame
   if (String.fromCharCode(a,b,c,d) === "OggS") return true;
   if (String.fromCharCode(a,b,c,d) === "ftyp") return true; // MP4/AAC
@@ -514,6 +528,3 @@ function extractAudioUrl(obj){
   }
   return null;
 }
-
-// ===== Optional: SSML escape =====
-// function escapeXml(s){ return s.replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&apos;','"':'&quot;'}[c])); }
