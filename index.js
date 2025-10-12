@@ -36,11 +36,9 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
-  // накапливаем текст по response_id
   const textByResponse = new Map();
   let lastRid = null;
 
-  // клиент -> openai
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
 
@@ -62,7 +60,6 @@ wss.on("connection", (client, req) => {
     }
   });
 
-  // openai -> клиент (и синтез Inworld)
   upstream.on("message", async (data, isBinary) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
@@ -73,21 +70,19 @@ wss.on("connection", (client, req) => {
     try { evt = JSON.parse(text); } catch { client.send(text, { binary: false }); return; }
 
     const type = evt?.type || "";
-
-    // запоминаем последний response_id, если обнаружили
     const ridNow = evt.response_id || evt.response?.id || null;
     if (ridNow) lastRid = ridNow;
 
-    // Копим любые строковые дельты (более надёжно, чем проверять тип)
+    // копим любые строковые дельты
     if (USE_INWORLD && typeof evt.delta === "string") {
       const rid = ridNow || lastRid;
       if (rid) {
         textByResponse.set(rid, (textByResponse.get(rid) || "") + evt.delta);
-        return; // текст UE не нужен
+        return;
       }
     }
 
-    // финал ответа: запускаем синтез и стримим в UE
+    // финал ответа — запускаем TTS
     if (USE_INWORLD && (type === "response.done" || type === "response.completed")) {
       const rid = ridNow || lastRid;
       const full = rid ? (textByResponse.get(rid) || "").trim() : "";
@@ -108,7 +103,6 @@ wss.on("connection", (client, req) => {
       return;
     }
 
-    // проксируем прочие события (session.*, errors, и т.д.)
     client.send(JSON.stringify(evt), { binary: false });
   });
 
@@ -139,7 +133,7 @@ server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 // -------- INWORLD TTS --------
 async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   const payload = { text, voiceId, modelId };
-  if (lang) payload.language = lang;
+  if (lang) payload.language = lang; // если их API поддерживает язык
 
   const r = await fetch(INWORLD_TTS, {
     method: "POST",
@@ -161,22 +155,26 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
     return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
   }
 
-  // 2) JSON с base64 или ссылкой
+  // 2) JSON
   try {
     const txt = buf.toString("utf8");
     const json = JSON.parse(txt);
 
-    // base64 в разных полях
-    let b64 = extractBase64Audio(json);
-    if (b64) {
-      const wav = Buffer.from(b64, "base64");
-      if (!looksLikeWav(wav)) throw new Error("Got base64 but not WAV");
-      const { sampleRate, channels, pcm16 } = parseWavPcm16(wav);
+    // Если это ошибка — покажем текст и упадём с ним (в логах видно code/message)
+    if (json && typeof json === "object" && ("code" in json || "message" in json)) {
+      console.error("Inworld error json:", json);
+      throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
+    }
+
+    // Пытаемся найти base64 WAV в любом поле
+    const wavBuf = findWavBase64InJson(json);
+    if (wavBuf) {
+      const { sampleRate, channels, pcm16 } = parseWavPcm16(wavBuf);
       const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
       return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
     }
 
-    // или url на файл
+    // Либо URL на WAV
     const url = extractAudioUrl(json);
     if (url) {
       const r2 = await fetch(url);
@@ -257,40 +255,31 @@ function resamplePcm16(pcm16, inRate, outRate){
 }
 
 // -------- JSON AUDIO HELPERS --------
-function looksLikeBase64(s){
-  return typeof s === "string" && s.length > 80 && /^[A-Za-z0-9+/=\r\n]+$/.test(s);
+function looksLikeBase64Loose(s){
+  return typeof s === "string" &&
+         s.length > 200 && // длинные строки
+         /^[A-Za-z0-9+/_=:\s-]+$/.test(s); // допускаем - и _ и пробелы/переносы и data:...;base64,
 }
-function extractBase64Audio(obj){
-  if (!obj || typeof obj !== "object") return null;
-  const cand = ["audio", "audioBase64", "audio_base64", "data", "audioContent", "wav"];
-  for (const k of cand) {
-    const v = obj[k];
-    if (looksLikeBase64(v)) return v;
-    if (v && typeof v === "object") {
-      if (looksLikeBase64(v.data)) return v.data;
-    }
-  }
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
-    if (looksLikeBase64(v)) return v;
-    if (v && typeof v === "object") {
-      const inner = extractBase64Audio(v);
-      if (inner) return inner;
-    }
-  }
-  return null;
+function tryDecodeWavBase64(s) {
+  if (typeof s !== "string") return null;
+  const i = s.indexOf("base64,");
+  const raw = i >= 0 ? s.slice(i + 7) : s;
+  try {
+    const buf = Buffer.from(raw.replace(/\s+/g,""), "base64");
+    return looksLikeWav(buf) ? buf : null;
+  } catch { return null; }
 }
-function extractAudioUrl(obj){
+function findWavBase64InJson(obj) {
   if (!obj || typeof obj !== "object") return null;
-  const cand = ["url","audioUrl","href","signedUrl","link"];
-  for (const k of cand) {
+  const keys = Object.keys(obj);
+  for (const k of keys) {
     const v = obj[k];
-    if (typeof v === "string" && /^https?:\/\//i.test(v)) return v;
-  }
-  for (const k of Object.keys(obj)) {
-    const v = obj[k];
+    if (typeof v === "string" && looksLikeBase64Loose(v)) {
+      const decoded = tryDecodeWavBase64(v);
+      if (decoded) return decoded;
+    }
     if (v && typeof v === "object") {
-      const inner = extractAudioUrl(v);
+      const inner = findWavBase64InJson(v);
       if (inner) return inner;
     }
   }
