@@ -12,17 +12,23 @@ const INWORLD_TTS   = process.env.INWORLD_TTS_URL || "https://api.inworld.ai/tts
 const INWORLD_AUTH  = process.env.INWORLD_API_KEY || ""; // "Basic <base64>" или просто "<base64>"
 const INWORLD_VOICE = process.env.INWORLD_VOICE || "Deborah";
 const INWORLD_MODEL = process.env.INWORLD_MODEL || "inworld-tts-1";
-const INWORLD_LANG  = process.env.INWORLD_LANG  || "";
+const INWORLD_LANG  = process.env.INWORLD_LANG  || "ru";
 const INWORLD_SR    = Number(process.env.INWORLD_SAMPLE_RATE || 16000);
+
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio"; // "response.audio" для старых клиентов
-const FAKE_TONE     = process.env.FAKE_TONE === "1"; // режим быстрой проверки канала
+const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
 const PORT = Number(process.env.PORT || 10000);
 
 // ===== APP =====
 const app = express();
 app.get("/", (_, res) => res.send("ok"));
-app.get("/health", (_, res) => res.json({ ok: true, useInworld: USE_INWORLD }));
+app.get("/health", (_, res) => res.json({
+  ok: true,
+  useInworld: USE_INWORLD,
+  audioEventPrefix: AUDIO_EVENT_PREFIX,
+  fakeTone: FAKE_TONE
+}));
 const server = http.createServer(app);
 
 // ===== WS RELAY =====
@@ -33,7 +39,11 @@ wss.on("connection", (client, req) => {
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
 
-  const upstreamUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}&voice=${encodeURIComponent(voice)}`;
+  // ВАЖНО: если используем Inworld — не прокидываем &voice=... в OpenAI
+  const upstreamUrl =
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}` +
+    (USE_INWORLD ? "" : `&voice=${encodeURIComponent(voice)}`);
+
   console.log("client connected", u.search, "USE_INWORLD=", USE_INWORLD);
 
   const upstream = new WebSocket(upstreamUrl, {
@@ -41,21 +51,28 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
-  const textByResponse = new Map(); // rid -> concat text
-  const outInfoByResponse = new Map(); // rid -> { itemId?: string, outputIndex?: number }
+  const textByResponse = new Map();     // rid -> text
+  const outInfoByResponse = new Map();  // rid -> { itemId?: string, outputIndex?: number }
 
   // клиент -> OpenAI
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
+
     if (!isBinary) {
       let s = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       try {
         const obj = JSON.parse(s);
+
+        // При USE_INWORLD просим у OpenAI только текст
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"]; // просим у OpenAI только текст
+          obj.response.modalities = ["text"];
+          // На всякий случай убираем потенциальные поля про аудио
+          delete obj.response.voice;
+          delete obj.response.audio;
           s = JSON.stringify(obj);
         }
+
         upstream.send(s, { binary: false });
       } catch {
         upstream.send(s, { binary: false });
@@ -77,7 +94,13 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
-    // Сохраняем связки item_id/output_index по ранним событиям
+    // Жёстко отсекаем любые аудио-события от OpenAI, если USE_INWORLD
+    if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) {
+      // console.log("drop OpenAI audio event:", type);
+      return;
+    }
+
+    // Запоминаем item_id / output_index
     if (USE_INWORLD && rid) {
       if (type === "response.output_item.added" || type === "response.content.part.added") {
         const info = outInfoByResponse.get(rid) || {};
@@ -93,7 +116,7 @@ wss.on("connection", (client, req) => {
       }
     }
 
-    // Копим текст из любых текстовых ивентов
+    // Копим текст для TTS
     if (USE_INWORLD && rid) {
       const picked = collectTextFromEvent(evt);
       if (picked) {
@@ -102,7 +125,7 @@ wss.on("connection", (client, req) => {
       }
     }
 
-    // Финал ответа — синтез и стрим аудио
+    // На финале — синтезируем и шлём своё аудио
     if (USE_INWORLD && rid && (type === "response.done" || type === "response.completed")) {
       const fullRaw = normalizeSpaces(textByResponse.get(rid) || "");
       try {
@@ -111,7 +134,7 @@ wss.on("connection", (client, req) => {
         const outputIndex = info.outputIndex ?? 0;
 
         if (FAKE_TONE) {
-          console.log("FAKE_TONE enabled: streaming test tone");
+          console.log("FAKE_TONE: stream test tone");
           const tone = makeSinePcm16(1200, 1000, INWORLD_SR);
           await streamPcm16ToClient(client, tone, rid, itemId, outputIndex);
           client.send(JSON.stringify({
@@ -143,28 +166,24 @@ wss.on("connection", (client, req) => {
         outInfoByResponse.delete(rid);
       }
 
-      // после аудио — проксируем оригинальный done
+      // затем — оригинальный done
       client.send(JSON.stringify(evt));
       return;
     }
 
-    // Прочее — просто проксируем
+    // Прочее — проксируем
     client.send(JSON.stringify(evt), { binary: false });
   });
 
   upstream.on("open", () => {
     console.log("upstream open");
-    const init = {
-      type: "session.update",
-      session: {
-        voice,
-        modalities: USE_INWORLD ? ["text"] : ["audio","text"],
-        input_audio_format: "pcm16",
-        output_audio_format: "pcm16" // безопасный формат
-        // при необходимости можно расширить до объекта:
-        // output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
-      }
+    const session = {
+      modalities: USE_INWORLD ? ["text"] : ["audio","text"],
+      input_audio_format: "pcm16",
+      output_audio_format: "pcm16"
     };
+    if (!USE_INWORLD) session.voice = voice; // только если используем голос OpenAI
+    const init = { type: "session.update", session };
     upstream.send(JSON.stringify(init));
   });
 
@@ -190,24 +209,29 @@ function collectTextFromEvent(evt) {
   return "";
 }
 
-// ===== Inworld TTS (устойчив к audio/wav и JSON audioContent) =====
+// ===== Inworld TTS: WAV или JSON audioContent (LINEAR16) =====
 async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16000) {
   const payload = { text, voiceId, modelId };
   if (lang) payload.language = lang;
 
-  // Пытаемся явно попросить WAV/PCM у бэка (если он поддерживает — ок, если нет — игнорирует):
-  payload.format = payload.format || "wav";
-  payload.sampleRate = payload.sampleRate || targetSr;
-  payload.sampleRateHertz = payload.sampleRateHertz || targetSr;
-  payload.audioEncoding = payload.audioEncoding || "LINEAR16";
-  payload.container = payload.container || "wav";
-  payload.encoding = payload.encoding || "LINEAR16";
+  // Пытаемся явно попросить несжатое аудио
+  Object.assign(payload, {
+    format: "wav",
+    audioFormat: "wav",
+    container: "wav",
+    encoding: "LINEAR16",
+    audioEncoding: "LINEAR16",
+    sampleRate: targetSr,
+    sampleRateHertz: targetSr,
+    channels: 1,
+    audio: { format: "wav", sampleRate: targetSr, channels: 1 },
+    audioConfig: { audioFormat: "wav", audioEncoding: "LINEAR16", sampleRateHertz: targetSr, channels: 1 }
+  });
 
   const r = await fetch(INWORLD_TTS, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      // Предпочитаем бинарный WAV, но согласны на JSON:
       "Accept": "audio/wav, application/json;q=0.9",
       "Authorization": INWORLD_AUTH.startsWith("Basic ") ? INWORLD_AUTH : `Basic ${INWORLD_AUTH}`
     },
@@ -217,34 +241,31 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   const ct  = (r.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await r.arrayBuffer());
 
-  // Вариант 1: пришёл WAV в теле
+  // Прямой WAV в теле
   if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
     const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
   }
 
-  // Вариант 2: пришёл JSON (audioContent base64 либо URL)
+  // JSON: ищем audioContent/URL/base64
   if (ct.includes("application/json")) {
     try {
       const json = JSON.parse(buf.toString("utf8"));
-      // Ошибка от Inworld?
+
       if (json && typeof json === "object" && (json.code || json.message)) {
         console.error("Inworld error json:", json);
         throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
       }
 
-      // 2.1) Прямое поле audioContent (как в Google TTS)
       const ac = findAudioContent(json);
       if (ac) {
         const audioBuf = decodeBase64Loose(ac);
-        // Если это WAV — парсим
         if (looksLikeWav(audioBuf)) {
           const { sampleRate, channels, pcm16 } = parseWavPcm16(audioBuf);
           const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
           return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
         }
-        // Если это LINEAR16 (raw PCM) — используем как есть
         const enc = (json.audioEncoding || json.encoding || json.audioConfig?.audioEncoding || "LINEAR16").toUpperCase();
         const sr  = Number(json.sampleRateHertz || json.sampleRate || json.audioConfig?.sampleRateHertz || targetSr) || targetSr;
         const ch  = Number(json.channels || json.channelCount || 1) || 1;
@@ -254,20 +275,13 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
           return sr === targetSr ? pcmRaw : resamplePcm16(pcmRaw, sr, targetSr);
         }
 
-        // Если сжал (MP3/OGG) — не декодируем, просим настроить WAV
         if (isCompressedAudio(audioBuf)) {
-          throw new Error("Inworld returned compressed audio (mp3/ogg). Set Accept=audio/wav or format=wav.");
+          throw new Error("Inworld returned compressed audio (mp3/ogg). Configure WAV/LINEAR16.");
         }
-
-        // Последний шанс: длина кратна 2 — похоже на PCM16
-        if (audioBuf.length % 2 === 0) {
-          return audioBuf; // считаем PCM16 @ targetSr
-        }
-
+        if (audioBuf.length % 2 === 0) return audioBuf; // может быть raw PCM16
         throw new Error("Unknown audioContent encoding");
       }
 
-      // 2.2) Ищем WAV base64 где угодно в JSON
       const wavBuf = findWavBase64InJson(json);
       if (wavBuf) {
         const { sampleRate, channels, pcm16 } = parseWavPcm16(wavBuf);
@@ -275,7 +289,6 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
         return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
       }
 
-      // 2.3) Или URL на WAV
       const url = extractAudioUrl(json);
       if (url) {
         const r2 = await fetch(url, { headers: { "Accept": "audio/wav,*/*;q=0.1" } });
@@ -287,19 +300,15 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
       }
 
       console.error("Inworld TTS JSON keys:", Object.keys(json));
-      throw new Error("No audioContent / WAV / URL in JSON");
+      throw new Error("No audio found in JSON");
     } catch (e) {
       console.error("Inworld TTS content-type:", ct, "len:", buf.length, "head:", buf.subarray(0,16).toString("hex"));
       throw e;
     }
   }
 
-  // Не JSON и не WAV — пробуем распознать по сигнатурам или ругаемся
-  if (isCompressedAudio(buf)) {
-    throw new Error("Inworld returned compressed audio (mp3/ogg). Set Accept=audio/wav or format=wav.");
-  }
-
-  console.error("Inworld TTS content-type:", ct, "len:", buf.length, "head:", buf.subarray(0,16).toString("hex"));
+  if (isCompressedAudio(buf)) throw new Error("Inworld returned compressed audio (mp3/ogg). Configure WAV/LINEAR16.");
+  console.error("Inworld TTS content-type:", ct, "len:", buf.length);
   throw new Error("Unexpected Inworld TTS response");
 }
 
@@ -379,8 +388,8 @@ function parseWavPcm16(buf) {
       const fmt = buf.readUInt16LE(pos + 8);
       channels = buf.readUInt16LE(pos + 10);
       sampleRate = buf.readUInt32LE(pos + 12);
-      bitsPerSample = buf.readUInt16LE(pos + 22);
-      if (fmt !== 1 || bitsPerSample !== 16) throw new Error(`Unsupported WAV: fmt=${fmt}, bps=${bitsPerSample}`);
+      const bps = buf.readUInt16LE(pos + 22);
+      if (fmt !== 1 || bps !== 16) throw new Error(`Unsupported WAV: fmt=${fmt}, bps=${bps}`);
     } else if (id === "data") {
       dataStart = pos + 8; dataLen = size; break;
     }
@@ -411,57 +420,34 @@ function resamplePcm16(pcm16, inRate, outRate){
   return Buffer.from(out16.buffer, out16.byteOffset, out16.length*2);
 }
 function isCompressedAudio(buf){
-  // MP3: "ID3" или 0xFFEx; OGG: "OggS"; M4A/AAC: "ftyp"
   if (buf.length < 4) return false;
   const a = buf[0], b = buf[1], c = buf[2], d = buf[3];
-  if (a===0x49 && b===0x44 && c===0x33) return true;            // "ID3"
+  if (a===0x49 && b===0x44 && c===0x33) return true;            // "ID3" (MP3)
   if (a===0xFF && (b & 0xE0) === 0xE0) return true;             // mp3 frame
-  if (String.fromCharCode(a,b,c,d) === "OggS") return true;     // ogg
-  if (String.fromCharCode(a,b,c,d) === "ftyp") return true;     // mp4/m4a
+  if (String.fromCharCode(a,b,c,d) === "OggS") return true;     // OGG
+  if (String.fromCharCode(a,b,c,d) === "ftyp") return true;     // MP4/M4A/AAC
   return false;
 }
 
-// ===== JSON AUDIO HELPERS =====
-function looksLikeBase64Loose(s){
-  return typeof s === "string" &&
-         s.length > 32 &&
-         /^[A-Za-z0-9+/_=:\s-]+$/.test(s);
-}
-function stripDataPrefix(s){
-  const i = s.indexOf("base64,");
-  return i >= 0 ? s.slice(i + 7) : s;
-}
-function decodeBase64Loose(s){
-  return Buffer.from(stripDataPrefix(String(s)).replace(/\s+/g,""), "base64");
-}
+// ===== JSON audio helpers =====
+function looksLikeBase64Loose(s){ return typeof s === "string" && s.length > 32 && /^[A-Za-z0-9+/_=:\s-]+$/.test(s); }
+function stripDataPrefix(s){ const i = s.indexOf("base64,"); return i >= 0 ? s.slice(i + 7) : s; }
+function decodeBase64Loose(s){ return Buffer.from(stripDataPrefix(String(s)).replace(/\s+/g,""), "base64"); }
 function findAudioContent(obj){
   if (!obj || typeof obj !== "object") return null;
   if (typeof obj.audioContent === "string") return obj.audioContent;
   if (obj.output && typeof obj.output.audioContent === "string") return obj.output.audioContent;
-  // по массивам тоже пройдёмся
-  if (Array.isArray(obj)) {
-    for (const v of obj) { const r = findAudioContent(v); if (r) return r; }
-  } else {
-    for (const v of Object.values(obj)) { if (v && typeof v === "object") { const r = findAudioContent(v); if (r) return r; } }
-  }
+  if (Array.isArray(obj)) { for (const v of obj) { const r = findAudioContent(v); if (r) return r; } }
+  else { for (const v of Object.values(obj)) if (v && typeof v === "object") { const r = findAudioContent(v); if (r) return r; } }
   return null;
 }
-function tryDecodeWavBase64(s) {
-  if (typeof s !== "string") return null;
-  const buf = decodeBase64Loose(s);
-  return looksLikeWav(buf) ? buf : null;
-}
+function tryDecodeWavBase64(s){ const buf = decodeBase64Loose(s); return looksLikeWav(buf) ? buf : null; }
 function findWavBase64InJson(obj) {
   if (!obj || typeof obj !== "object") return null;
   if (Array.isArray(obj)) { for (const v of obj) { const got = findWavBase64InJson(v); if (got) return got; } return null; }
   for (const [_, v] of Object.entries(obj)) {
-    if (typeof v === "string" && looksLikeBase64Loose(v)) {
-      const decoded = tryDecodeWavBase64(v);
-      if (decoded) return decoded;
-    } else if (v && typeof v === "object") {
-      const inner = findWavBase64InJson(v);
-      if (inner) return inner;
-    }
+    if (typeof v === "string" && looksLikeBase64Loose(v)) { const decoded = tryDecodeWavBase64(v); if (decoded) return decoded; }
+    else if (v && typeof v === "object") { const inner = findWavBase64InJson(v); if (inner) return inner; }
   }
   return null;
 }
@@ -473,11 +459,8 @@ function extractAudioUrl(obj){
     const v = obj[k];
     if (typeof v === "string" && /^https?:\/\//i.test(v)) return v;
   }
-  for (const v of Object.values(obj)) {
-    if (v && typeof v === "object") {
-      const inner = extractAudioUrl(v);
-      if (inner) return inner;
-    }
+  for (const v of Object.values(obj)) if (v && typeof v === "object") {
+    const inner = extractAudioUrl(v); if (inner) return inner;
   }
   return null;
 }
