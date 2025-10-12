@@ -9,12 +9,12 @@ if (!OPENAI_KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
 
 const USE_INWORLD   = process.env.USE_INWORLD === "1";
 const INWORLD_TTS   = process.env.INWORLD_TTS_URL || "https://api.inworld.ai/tts/v1/voice";
-const INWORLD_AUTH  = process.env.INWORLD_API_KEY || "";  // "Basic <base64>"
+const INWORLD_AUTH  = process.env.INWORLD_API_KEY || "";  // "Basic <base64>" или просто <base64>, префикс добавим
 const INWORLD_VOICE = process.env.INWORLD_VOICE || "Deborah";
 const INWORLD_MODEL = process.env.INWORLD_MODEL || "inworld-tts-1";
 const INWORLD_LANG  = process.env.INWORLD_LANG  || "";
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT || 10000);
 
 // ===== APP =====
 const app = express();
@@ -26,7 +26,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (client, req) => {
-  const u = new URL(req.url, "http://x");
+  const u = new URL(req.url, "http://local");
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
 
@@ -39,7 +39,9 @@ wss.on("connection", (client, req) => {
   });
 
   // Копим текст по response_id
-  const textByResponse = new Map();
+  const textByResponse = new Map(); // rid -> string
+  // Запоминаем item_id / output_index, чтобы аудио привязать к нужному item
+  const outInfoByResponse = new Map(); // rid -> { itemId?: string, outputIndex?: number }
 
   // клиент -> OpenAI
   client.on("message", (data, isBinary) => {
@@ -49,9 +51,10 @@ wss.on("connection", (client, req) => {
       let s = Buffer.isBuffer(data) ? data.toString("utf8") : String(data);
       try {
         const obj = JSON.parse(s);
+        // Если используем Inworld — просим у OpenAI только текст
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"]; // у OpenAI просим только текст
+          obj.response.modalities = ["text"];
           s = JSON.stringify(obj);
         }
         upstream.send(s, { binary: false });
@@ -74,29 +77,58 @@ wss.on("connection", (client, req) => {
     try { evt = JSON.parse(text); } catch { client.send(text, { binary: false }); return; }
 
     const type = evt?.type || "";
-    const rid  = evt.response_id || evt.response?.id || null;
+    const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
-    // 1) Копим текст из любых текстовых ивентов (дельты, финальный текст, conversation.item.created)
+    // 0) Запоминаем item_id / output_index из ранних событий
+    if (USE_INWORLD && rid) {
+      if (type === "response.output_item.added" || type === "response.content.part.added") {
+        const info = outInfoByResponse.get(rid) || {};
+        const gotItemId = evt.item_id || evt.item?.id;
+        if (gotItemId && !info.itemId) info.itemId = gotItemId;
+        if (typeof evt.output_index === "number") info.outputIndex = evt.output_index;
+        outInfoByResponse.set(rid, info);
+      }
+      if (type === "conversation.item.created" && evt.item?.id) {
+        const info = outInfoByResponse.get(rid) || {};
+        // fallback, если до output_item.added не дойдёт
+        if (!info.itemId) info.itemId = evt.item.id;
+        outInfoByResponse.set(rid, info);
+      }
+    }
+
+    // 1) Копим текст из любых текстовых ивентов (дельты, финальный текст)
     if (USE_INWORLD && rid) {
       const picked = collectTextFromEvent(evt);
       if (picked) {
         const prev = textByResponse.get(rid) || "";
         textByResponse.set(rid, prev + picked);
-        // текст UE не нужен, не возвращаемся — проксируем событие дальше
       }
     }
 
-    // 2) Финал ответа — нарезаем и озвучиваем сегменты ≤ ~1800 символов
+    // 2) Финал ответа — синтез и стрим аудио
     if (USE_INWORLD && rid && (type === "response.done" || type === "response.completed")) {
       const fullRaw = normalizeSpaces(textByResponse.get(rid) || "");
       try {
         if (fullRaw) {
           const segments = chunkText(fullRaw, 1800);
           console.log(`INWORLD synth segments=${segments.length}, totalLen=${fullRaw.length}`);
-          for (const seg of segments) {
+          const info = outInfoByResponse.get(rid) || {};
+          const itemId = info.itemId;
+          const outputIndex = info.outputIndex ?? 0;
+
+          for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i];
             const pcm16 = await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG);
-            await streamPcm16ToClient(client, pcm16);
+            await streamPcm16ToClient(client, pcm16, rid, itemId, outputIndex);
           }
+
+          // конец аудиопотока для этого ответа
+          client.send(JSON.stringify({
+            type: "response.output_audio.done",
+            response_id: rid,
+            ...(itemId ? { item_id: itemId } : {}),
+            output_index: outputIndex
+          }));
         } else {
           console.log("INWORLD synth: empty text");
         }
@@ -104,7 +136,9 @@ wss.on("connection", (client, req) => {
         console.error("inworld synth error:", e);
       } finally {
         textByResponse.delete(rid);
+        outInfoByResponse.delete(rid);
       }
+      // затем проксируем оригинальное done
       client.send(JSON.stringify(evt));
       return;
     }
@@ -121,7 +155,7 @@ wss.on("connection", (client, req) => {
         voice,
         modalities: USE_INWORLD ? ["text"] : ["audio","text"],
         input_audio_format: "pcm16",
-        output_audio_format: "pcm16"  // всегда валидный кодек
+        output_audio_format: "pcm16" // всегда валидный кодек
       }
     };
     upstream.send(JSON.stringify(init));
@@ -143,7 +177,7 @@ function collectTextFromEvent(evt) {
   if (/(response\.(output_)?text\.delta)/.test(type) && typeof evt.delta === "string") {
     return evt.delta;
   }
-  // response.text.done (иногда кладет итог сразу в text)
+  // response.text.done / response.output_text.done
   if (/(response\.(output_)?text\.done)/.test(type) && typeof evt.text === "string") {
     return evt.text;
   }
@@ -176,14 +210,14 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   const ct  = (r.headers.get("content-type") || "").toLowerCase();
   const buf = Buffer.from(await r.arrayBuffer());
 
-  // 1) WAV
+  // 1) WAV в теле
   if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
     const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
   }
 
-  // 2) JSON
+  // 2) JSON: ошибка, base64, или URL
   try {
     const txt  = buf.toString("utf8");
     const json = JSON.parse(txt);
@@ -194,7 +228,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
       throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
     }
 
-    // base64 WAV в любом поле (включая data:audio/wav;base64,...)
+    // base64 WAV в любом поле
     const wavBuf = findWavBase64InJson(json);
     if (wavBuf) {
       const { sampleRate, channels, pcm16 } = parseWavPcm16(wavBuf);
@@ -221,15 +255,25 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   }
 }
 
-// ===== STREAM PCM TO UE =====
-async function streamPcm16ToClient(client, pcm) {
-  const chunkBytes = 480 * 2; // ~30мс @16kHz
-  for (let o = 0; o < pcm.length; o += chunkBytes) {
+// ===== STREAM PCM TO CLIENT (response.output_audio.*) =====
+async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex = 0) {
+  const sampleRate = 16000;
+  const bytesPerChunk = 480 * 2; // 480 сэмплов * 2 байта = ~30мс @16k
+  for (let o = 0; o < pcm.length; o += bytesPerChunk) {
     if (client.readyState !== WebSocket.OPEN) break;
-    const chunk = pcm.subarray(o, Math.min(o + chunkBytes, pcm.length));
+    const chunk = pcm.subarray(o, Math.min(o + bytesPerChunk, pcm.length));
     const b64 = chunk.toString("base64");
-    client.send(JSON.stringify({ type: "output_audio_buffer.append", audio: b64 }));
-    await wait(30);
+
+    client.send(JSON.stringify({
+      type: "response.output_audio.delta",
+      response_id: responseId,
+      ...(itemId ? { item_id: itemId } : {}),
+      output_index: outputIndex,
+      audio: b64
+    }));
+
+    const ms = Math.round((chunk.length / 2 /* int16 samples */) / sampleRate * 1000);
+    await wait(Math.max(1, ms));
   }
 }
 function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
