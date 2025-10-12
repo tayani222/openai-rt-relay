@@ -3,24 +3,24 @@ import express from "express";
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
-// ---------- env ----------
+// -------- ENV --------
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 if (!OPENAI_KEY) { console.error("No OPENAI_API_KEY"); process.exit(1); }
 
 const USE_INWORLD   = process.env.USE_INWORLD === "1";
 const INWORLD_TTS   = process.env.INWORLD_TTS_URL || "https://api.inworld.ai/tts/v1/voice";
-const INWORLD_AUTH  = process.env.INWORLD_API_KEY || ""; // желательно в формате "Basic <base64>"
+const INWORLD_AUTH  = process.env.INWORLD_API_KEY || "";  // желательно "Basic <base64>"
 const INWORLD_VOICE = process.env.INWORLD_VOICE || "Deborah";
 const INWORLD_MODEL = process.env.INWORLD_MODEL || "inworld-tts-1";
 const INWORLD_LANG  = process.env.INWORLD_LANG  || "";
 
-// ---------- app ----------
+// -------- APP --------
 const app = express();
 app.get("/", (_, res) => res.send("ok"));
 app.get("/health", (_, res) => res.json({ ok: true, useInworld: USE_INWORLD }));
 const server = http.createServer(app);
 
-// ---------- ws relay ----------
+// -------- WS RELAY --------
 const wss = new WebSocketServer({ server, path: "/ws" });
 
 wss.on("connection", (client, req) => {
@@ -36,8 +36,10 @@ wss.on("connection", (client, req) => {
     perMessageDeflate: false,
   });
 
+  // накапливаем текст по response_id
   const textByResponse = new Map();
 
+  // клиент -> openai
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
 
@@ -47,7 +49,7 @@ wss.on("connection", (client, req) => {
         const obj = JSON.parse(s);
         if (USE_INWORLD && obj?.type === "response.create") {
           obj.response = obj.response || {};
-          obj.response.modalities = ["text"]; // просим только текст
+          obj.response.modalities = ["text"];   // у OpenAI просим только текст
           s = JSON.stringify(obj);
         }
         upstream.send(s, { binary: false });
@@ -59,6 +61,7 @@ wss.on("connection", (client, req) => {
     }
   });
 
+  // openai -> клиент (и синтез Inworld)
   upstream.on("message", async (data, isBinary) => {
     if (client.readyState !== WebSocket.OPEN) return;
 
@@ -70,12 +73,14 @@ wss.on("connection", (client, req) => {
 
     const type = evt?.type || "";
 
+    // копим дельты текста
     if (USE_INWORLD && (type.includes("output_text.delta") || type.includes("text.delta"))) {
       const rid = evt.response_id || evt.response?.id;
       if (rid) textByResponse.set(rid, (textByResponse.get(rid) || "") + (evt.delta || ""));
-      return;
+      return; // текст UE не нужен
     }
 
+    // финал ответа: запускаем синтез и стримим в UE
     if (USE_INWORLD && (type === "response.done" || type === "response.completed")) {
       const rid = evt.response_id || evt.response?.id;
       const full = (rid && textByResponse.get(rid)) ? textByResponse.get(rid).trim() : "";
@@ -96,6 +101,7 @@ wss.on("connection", (client, req) => {
       return;
     }
 
+    // проксируем прочие события
     client.send(JSON.stringify(evt), { binary: false });
   });
 
@@ -117,13 +123,13 @@ wss.on("connection", (client, req) => {
   client.on("close", closeBoth);
   client.on("error", closeBoth);
   upstream.on("close", closeBoth);
-  upstream.on("error", (e) => console.error("upstream error", e.message));
+  upstream.on("error", (e) => console.error("upstream error:", e.message));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
-// ---------- Inworld TTS ----------
+// -------- INWORLD TTS --------
 async function synthesizeWithInworld(text, voiceId, modelId, lang) {
   const payload = { text, voiceId, modelId };
   if (lang) payload.language = lang;
@@ -132,63 +138,87 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Accept": "audio/wav",
+      "Accept": "*/*", // примем и audio/wav, и json
       "Authorization": INWORLD_AUTH.startsWith("Basic ") ? INWORLD_AUTH : `Basic ${INWORLD_AUTH}`
     },
     body: JSON.stringify(payload)
   });
 
-  if (!r.ok) {
-    const t = await r.text().catch(()=> "");
-    throw new Error(`Inworld TTS ${r.status} ${t}`);
-  }
-  const ct = r.headers.get("content-type") || "";
-  if (ct.includes("audio/")) {
-    const buf = Buffer.from(await r.arrayBuffer());
+  const ct = (r.headers.get("content-type") || "").toLowerCase();
+  const buf = Buffer.from(await r.arrayBuffer());
+
+  // 1) бинарный WAV
+  if (looksLikeWav(buf)) {
     const { sampleRate, channels, pcm16 } = parseWavPcm16(buf);
-    let mono = pcm16;
-    if (channels > 1) mono = stereoToMono(mono);
+    const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
     return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
-  } else {
-    const j = await r.json();
-    const b64 = j.audio || j.audioBase64 || j.data;
-    if (!b64) throw new Error("Unexpected Inworld TTS response");
-    const wav = Buffer.from(b64, "base64");
-    const { sampleRate, channels, pcm16 } = parseWavPcm16(wav);
-    let mono = pcm16;
-    if (channels > 1) mono = stereoToMono(mono);
-    return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
+  }
+
+  // 2) JSON с base64 или ссылкой
+  try {
+    const txt = buf.toString("utf8");
+    const json = JSON.parse(txt);
+
+    // base64 в разных полях
+    let b64 = extractBase64Audio(json);
+    if (b64) {
+      const wav = Buffer.from(b64, "base64");
+      if (!looksLikeWav(wav)) throw new Error("Got base64 but not WAV");
+      const { sampleRate, channels, pcm16 } = parseWavPcm16(wav);
+      const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
+      return sampleRate === 16000 ? mono : resamplePcm16(mono, sampleRate, 16000);
+    }
+
+    // или url на файл
+    const url = extractAudioUrl(json);
+    if (url) {
+      const r2 = await fetch(url);
+      const buf2 = Buffer.from(await r2.arrayBuffer());
+      if (!looksLikeWav(buf2)) throw new Error(`Fetched URL but not WAV (ct=${r2.headers.get("content-type")})`);
+      const { sampleRate, channels, pcm16 } = parseWavPcm16(buf2);
+      const mono2 = channels > 1 ? stereoToMono(pcm16) : pcm16;
+      return sampleRate === 16000 ? mono2 : resamplePcm16(mono2, sampleRate, 16000);
+    }
+
+    console.error("Inworld TTS JSON keys:", Object.keys(json));
+    throw new Error("No audio field in JSON");
+  } catch (e) {
+    console.error("Inworld TTS content-type:", ct, "len:", buf.length, "head:", buf.subarray(0,16).toString("hex"));
+    throw new Error("Unexpected Inworld TTS response");
   }
 }
 
+// -------- STREAM PCM TO UE --------
 async function streamPcm16ToClient(client, pcm) {
-  const chunkBytes = 480 * 2; // 30мс @16kHz
+  const chunkBytes = 480 * 2; // ~30мс @16kHz
   for (let o = 0; o < pcm.length; o += chunkBytes) {
+    if (client.readyState !== WebSocket.OPEN) break;
     const chunk = pcm.subarray(o, Math.min(o + chunkBytes, pcm.length));
     const b64 = chunk.toString("base64");
-    const msg = JSON.stringify({ type: "output_audio_buffer.append", audio: b64 });
-    if (client.readyState !== WebSocket.OPEN) break;
-    client.send(msg);
+    client.send(JSON.stringify({ type: "output_audio_buffer.append", audio: b64 }));
     await wait(30);
   }
 }
 function wait(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-// ---------- WAV utils ----------
+// -------- WAV UTILS --------
+function looksLikeWav(buf) {
+  return buf.length >= 12 &&
+         buf.toString("ascii", 0, 4) === "RIFF" &&
+         buf.toString("ascii", 8, 12) === "WAVE";
+}
 function parseWavPcm16(buf) {
-  if (buf.toString("ascii",0,4)!=="RIFF" || buf.toString("ascii",8,12)!=="WAVE") {
-    throw new Error("Not a WAV file");
-  }
+  if (!looksLikeWav(buf)) throw new Error("Not a WAV file");
   let pos = 12, sampleRate = 16000, channels = 1, bitsPerSample = 16;
   let dataStart = -1, dataLen = 0;
   while (pos + 8 <= buf.length) {
-    const id = buf.toString("ascii", pos, pos+4);
-    const size = buf.readUInt32LE(pos+4);
+    const id = buf.toString("ascii", pos, pos + 4);
+    const size = buf.readUInt32LE(pos + 4);
     if (id === "fmt ") {
-      const fmt = buf.readUInt16LE(pos+8);
-      channels = buf.readUInt16LE(pos+10);
-      sampleRate = buf.readUInt32LE(pos+12);
-      bitsPerSample = buf.readUInt16LE(pos+22);
+      const fmt = buf.readUInt16LE(pos + 8);
+      channels = buf.readUInt16LE(pos + 10);
+      sampleRate = buf.readUInt32LE(pos + 12);
+      bitsPerSample = buf.readUInt16LE(pos + 22);
       if (fmt !== 1 || bitsPerSample !== 16) throw new Error(`Unsupported WAV: fmt=${fmt}, bps=${bitsPerSample}`);
     } else if (id === "data") {
       dataStart = pos + 8; dataLen = size; break;
@@ -217,4 +247,45 @@ function resamplePcm16(pcm16, inRate, outRate){
     out16[i] = (in16[s0]*(1-t) + in16[s1]*t) | 0;
   }
   return Buffer.from(out16.buffer, out16.byteOffset, out16.length*2);
+}
+
+// -------- JSON AUDIO HELPERS --------
+function looksLikeBase64(s){
+  return typeof s === "string" && s.length > 80 && /^[A-Za-z0-9+/=\r\n]+$/.test(s);
+}
+function extractBase64Audio(obj){
+  if (!obj || typeof obj !== "object") return null;
+  const cand = ["audio", "audioBase64", "audio_base64", "data", "audioContent", "wav"];
+  for (const k of cand) {
+    const v = obj[k];
+    if (looksLikeBase64(v)) return v;
+    if (v && typeof v === "object") {
+      if (looksLikeBase64(v.data)) return v.data;
+    }
+  }
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (looksLikeBase64(v)) return v;
+    if (v && typeof v === "object") {
+      const inner = extractBase64Audio(v);
+      if (inner) return inner;
+    }
+  }
+  return null;
+}
+function extractAudioUrl(obj){
+  if (!obj || typeof obj !== "object") return null;
+  const cand = ["url","audioUrl","href","signedUrl","link"];
+  for (const k of cand) {
+    const v = obj[k];
+    if (typeof v === "string" && /^https?:\/\//i.test(v)) return v;
+  }
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === "object") {
+      const inner = extractAudioUrl(v);
+      if (inner) return inner;
+    }
+  }
+  return null;
 }
