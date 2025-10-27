@@ -48,6 +48,10 @@ function pickGreeting(exclude = []) {
   const list = pool.length ? pool : GREETINGS;
   return list[Math.floor(Math.random() * list.length)];
 }
+function isGreetingText(t) {
+  const s = String(t || "").toLowerCase();
+  return /(прив(ет)?|здравств|здоров|салют|добр(ое|ый)\s+(утро|день|вечер)|hi|hello|hey|yo|sup|hiya)/i.test(s);
+}
 
 const MAX_MEMORY_FACTS = Number(process.env.MAX_MEMORY_FACTS || 16);
 const mem = new Map();
@@ -96,6 +100,7 @@ wss.on("connection", (client, req) => {
   let turnPCM = [];
   let pendingTranscript = null;
   const lastGreets = [];
+  let suppressCreateUntil = 0;
 
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
@@ -156,6 +161,7 @@ wss.on("connection", (client, req) => {
           if (!autoTimer) {
             autoTimer = setTimeout(() => {
               autoTimer = null;
+              if (Date.now() < suppressCreateUntil) return;
               safeCreateResponse("auto");
             }, AUTO_DELAY_MS);
           }
@@ -164,7 +170,38 @@ wss.on("connection", (client, req) => {
           const pcm = turnPCM.length ? Buffer.concat(turnPCM) : Buffer.alloc(0);
           turnPCM = [];
           if (pcm.length) {
-            pendingTranscript = transcribePCM16(pcm).catch(() => null);
+            pendingTranscript = transcribePCM16(pcm).then(async (utter) => {
+              if (!utter) return;
+              if (isGreetingText(utter)) {
+                if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+                if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+                suppressCreateUntil = Date.now() + 1500;
+                const phrase = pickGreeting(lastGreets);
+                const phraseClean = sanitize(phrase);
+                if (phraseClean) {
+                  lastGreets.unshift(phraseClean);
+                  if (lastGreets.length > 5) lastGreets.length = 5;
+                  const rid = `greet_${Date.now()}`;
+                  if (USE_INWORLD) {
+                    const parts = chunkText(phraseClean, CHUNK_TEXT_MAX);
+                    let first = true;
+                    for (const p of parts) {
+                      const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+                      await streamPcm16ToClient(client, pcm, rid, undefined, 0, first);
+                      first = false;
+                    }
+                    try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
+                  } else {
+                    const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phraseClean}` } };
+                    try { upstream.send(JSON.stringify(payload)); } catch {}
+                  }
+                }
+              } else {
+                const { facts, player_name } = await extractFactsFromUtterance(utter).catch(() => ({ facts:[], player_name:null }));
+                if (player_name) rememberName(userId, player_name);
+                if (facts?.length) rememberFacts(userId, facts);
+              }
+            }).catch(() => null);
           }
         } catch {}
         upstream.send(JSON.stringify(obj), { binary: false });
@@ -175,6 +212,7 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "memory.add") { rememberFacts(userId, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
+        if (Date.now() < suppressCreateUntil) return;
         if (AUTO_RESPONSE) {
           if (obj.response?.instructions) baseInstructions = obj.response.instructions;
           console.log("drop client response.create (AUTO_RESPONSE active)");
@@ -279,9 +317,6 @@ wss.on("connection", (client, req) => {
             const { facts, player_name } = await extractFactsFromUtterance(utterance);
             if (player_name) rememberName(userId, player_name);
             if (facts?.length) rememberFacts(userId, facts);
-            if (player_name || facts?.length) {
-              console.log(`[memory] ${userId}: name=${getName(userId) || "-"}, facts=${getFacts(userId).length}`);
-            }
           }
         }
       } catch (e) {
@@ -324,6 +359,7 @@ wss.on("connection", (client, req) => {
 
   function safeCreateResponse(source) {
     if (upstream.readyState !== WebSocket.OPEN) return;
+    if (Date.now() < suppressCreateUntil) return;
     const payload = {
       type: "response.create",
       response: {
