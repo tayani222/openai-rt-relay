@@ -32,6 +32,23 @@ const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
 const PORT = Number(process.env.PORT || 10000);
 
+const GREETINGS = [
+  "Oh my god, you again?!",
+  "You’re such a menace!",
+  "Stop wrecking everything, psycho!",
+  "Someone arrest this maniac already!",
+  "Ugh, you’re scaring everyone!",
+  "What’s wrong with you?!",
+  "I swear, you need therapy.",
+  "You’re crazy — and not in a cute way!"
+];
+function pickGreeting(exclude = []) {
+  const ex = new Set(exclude.map(x => String(x).trim().toLowerCase()));
+  const pool = GREETINGS.filter(p => !ex.has(p.trim().toLowerCase()));
+  const list = pool.length ? pool : GREETINGS;
+  return list[Math.floor(Math.random() * list.length)];
+}
+
 const MAX_MEMORY_FACTS = Number(process.env.MAX_MEMORY_FACTS || 16);
 const mem = new Map();
 function getSlot(userId) { let s = mem.get(userId); if (!s) { s = { name: null, facts: [] }; mem.set(userId, s); } return s; }
@@ -78,6 +95,7 @@ wss.on("connection", (client, req) => {
   const byRid = new Map();
   let turnPCM = [];
   let pendingTranscript = null;
+  const lastGreets = [];
 
   client.on("message", (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
@@ -97,13 +115,16 @@ wss.on("connection", (client, req) => {
         return;
       }
 
-      if (obj?.type === "relay.speak_text") {
-        const t = sanitize(obj.text || "");
-        if (t) {
-          const rid = `manual_${Date.now()}`;
+      if (obj?.type === "relay.greet") {
+        const phrase = pickGreeting(lastGreets);
+        const phraseClean = sanitize(phrase);
+        if (phraseClean) {
+          lastGreets.unshift(phraseClean);
+          if (lastGreets.length > 5) lastGreets.length = 5;
+          const rid = `greet_${Date.now()}`;
           (async () => {
             if (USE_INWORLD) {
-              const parts = chunkText(t, CHUNK_TEXT_MAX);
+              const parts = chunkText(phraseClean, CHUNK_TEXT_MAX);
               let first = true;
               for (const p of parts) {
                 const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
@@ -112,16 +133,14 @@ wss.on("connection", (client, req) => {
               }
               try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
             } else {
-              const m = { type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: t }] } };
-              try { upstream.send(JSON.stringify(m)); safeCreateResponse("speak_text"); } catch {}
+              const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phraseClean}` } };
+              if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+              try { upstream.send(JSON.stringify(payload)); } catch {}
             }
           })();
         }
         return;
       }
-
-      if (obj?.type === "memory.set_name") { rememberName(userId, String(obj.name||"")); return; }
-      if (obj?.type === "memory.add") { rememberFacts(userId, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "input_audio_buffer.append") {
         const b64 = obj.audio || obj.delta || "";
@@ -151,6 +170,9 @@ wss.on("connection", (client, req) => {
         upstream.send(JSON.stringify(obj), { binary: false });
         return;
       }
+
+      if (obj?.type === "memory.set_name") { rememberName(userId, String(obj.name||"")); return; }
+      if (obj?.type === "memory.add") { rememberFacts(userId, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
         if (AUTO_RESPONSE) {
@@ -235,7 +257,6 @@ wss.on("connection", (client, req) => {
           tracker.buf = "";
           if (isSpeakable(tail)) {
             for (const seg of chunkText(tail, CHUNK_TEXT_MAX)) await enqueueSynth(seg, rid, tracker);
-          } else if (!tracker.started) {
           }
           await tracker.speakChain.then(() => {
             client.send(JSON.stringify({
@@ -362,7 +383,7 @@ function cutCompleteSentences(input, minChars = 6, hardMax = 300) {
       last = m.index + m[0].length;
     }
   }
-  const rest = t.slice[last).trim();
+  const rest = t.slice(last).trim();
   if (rest.length > hardMax) {
     const parts = chunkText(rest, hardMax);
     return { complete: out.concat(parts.slice(0, -1)), rest: parts.at(-1) || "" };
