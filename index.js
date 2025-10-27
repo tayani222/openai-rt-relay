@@ -90,8 +90,38 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "session.update" && obj.session) {
         if (typeof obj.session.instructions === "string") {
           baseInstructions = obj.session.instructions || "";
+          obj.session.instructions = compileInstr(baseInstructions, userId);
+          currentInstructions = obj.session.instructions;
         }
+        upstream.send(JSON.stringify(obj), { binary: false });
+        return;
       }
+
+      if (obj?.type === "relay.speak_text") {
+        const t = sanitize(obj.text || "");
+        if (t) {
+          const rid = `manual_${Date.now()}`;
+          (async () => {
+            if (USE_INWORLD) {
+              const parts = chunkText(t, CHUNK_TEXT_MAX);
+              let first = true;
+              for (const p of parts) {
+                const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+                await streamPcm16ToClient(client, pcm, rid, undefined, 0, first);
+                first = false;
+              }
+              try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
+            } else {
+              const m = { type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text: t }] } };
+              try { upstream.send(JSON.stringify(m)); safeCreateResponse("speak_text"); } catch {}
+            }
+          })();
+        }
+        return;
+      }
+
+      if (obj?.type === "memory.set_name") { rememberName(userId, String(obj.name||"")); return; }
+      if (obj?.type === "memory.add") { rememberFacts(userId, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "input_audio_buffer.append") {
         const b64 = obj.audio || obj.delta || "";
@@ -183,18 +213,6 @@ wss.on("connection", (client, req) => {
 
     if (USE_INWORLD && rid && byRid.has(rid)) {
       const tracker = byRid.get(rid);
-      if (type === "response.output_item.added" || type === "response.content.part.added") {
-        const gotItemId = evt.item_id || evt.item?.id;
-        if (gotItemId && !tracker.itemId) tracker.itemId = gotItemId;
-        if (typeof evt.output_index === "number") tracker.outputIndex = evt.output_index;
-      }
-      if (type === "conversation.item.created" && evt.item?.id && !tracker.itemId) {
-        tracker.itemId = evt.item.id;
-      }
-    }
-
-    if (USE_INWORLD && rid && byRid.has(rid)) {
-      const tracker = byRid.get(rid);
       const picked = pickDeltaOnly(evt);
       if (picked) {
         tracker.buf += picked;
@@ -217,6 +235,7 @@ wss.on("connection", (client, req) => {
           tracker.buf = "";
           if (isSpeakable(tail)) {
             for (const seg of chunkText(tail, CHUNK_TEXT_MAX)) await enqueueSynth(seg, rid, tracker);
+          } else if (!tracker.started) {
           }
           await tracker.speakChain.then(() => {
             client.send(JSON.stringify({
@@ -257,7 +276,6 @@ wss.on("connection", (client, req) => {
     async function enqueueSynth(rawSeg, rid, tracker) {
       const seg = sanitize(rawSeg);
       if (!isSpeakable(seg)) return;
-      logSeg("SAY", rid, seg);
       tracker.speakChain = tracker.speakChain.then(async () => {
         try {
           const pcm = FAKE_TONE
@@ -344,7 +362,7 @@ function cutCompleteSentences(input, minChars = 6, hardMax = 300) {
       last = m.index + m[0].length;
     }
   }
-  const rest = t.slice(last).trim();
+  const rest = t.slice[last).trim();
   if (rest.length > hardMax) {
     const parts = chunkText(rest, hardMax);
     return { complete: out.concat(parts.slice(0, -1)), rest: parts.at(-1) || "" };
@@ -426,7 +444,6 @@ function makeSinePcm16(ms = 900, hz = 900, sr = 16000) {
 
 async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16000) {
   if (!isSpeakable(text)) throw new Error("synthesizeWithInworld: empty/unspeakable text");
-
   const payload = {
     text, voiceId, modelId, language: lang,
     format: "wav", audioFormat: "wav", container: "wav",
@@ -461,43 +478,47 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   }
 
   if (ct.includes("application/json")) {
-    const json = await r.json();
-    if (json && typeof json === "object" && (json.code || json.message)) throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
-    const ac = findAudioContent(json);
-    if (ac) {
-      const audioBuf = decodeBase64Loose(ac);
-      if (looksLikeWav(audioBuf)) {
-        const { sampleRate, channels, pcm16 } = parseWavPcm16(audioBuf);
+    try {
+      const json = JSON.parse(buf.toString("utf8"));
+      if (json && typeof json === "object" && (json.code || json.message)) throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
+      const ac = findAudioContent(json);
+      if (ac) {
+        const audioBuf = decodeBase64Loose(ac);
+        if (looksLikeWav(audioBuf)) {
+          const { sampleRate, channels, pcm16 } = parseWavPcm16(audioBuf);
+          const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
+          return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
+        }
+        const enc = (json.audioEncoding || json.encoding || json.audioConfig?.audioEncoding || "LINEAR16").toUpperCase();
+        const sr  = Number(json.sampleRateHertz || json.sampleRate || json.audioConfig?.sampleRateHertz || targetSr) || targetSr;
+        const ch  = Number(json.channels || json.channelCount || 1) || 1;
+        if (enc.includes("LINEAR16") || enc.includes("PCM")) {
+          const pcmRaw = ch > 1 ? stereoToMono(audioBuf) : audioBuf;
+          return sr === targetSr ? pcmRaw : resamplePcm16(pcmRaw, sr, targetSr);
+        }
+        if (isCompressedAudio(audioBuf)) throw new Error("Inworld returned compressed audio");
+        if (audioBuf.length % 2 === 0) return audioBuf;
+        throw new Error("Unknown audioContent encoding");
+      }
+      const wavBuf = findWavBase64InJson(json);
+      if (wavBuf) {
+        const { sampleRate, channels, pcm16 } = parseWavPcm16(wavBuf);
         const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
         return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
       }
-      const enc = (json.audioEncoding || json.encoding || json.audioConfig?.audioEncoding || "LINEAR16").toUpperCase();
-      const sr  = Number(json.sampleRateHertz || json.sampleRate || json.audioConfig?.sampleRateHertz || targetSr) || targetSr;
-      const ch  = Number(json.channels || json.channelCount || 1) || 1;
-      if (enc.includes("LINEAR16") || enc.includes("PCM")) {
-        const pcmRaw = ch > 1 ? stereoToMono(audioBuf) : audioBuf;
-        return sr === targetSr ? pcmRaw : resamplePcm16(pcmRaw, sr, targetSr);
+      const url = extractAudioUrl(json);
+      if (url) {
+        const r2 = await fetch(url, { headers: { "Accept": "audio/wav,*/*;q=0.1" } });
+        const buf2 = Buffer.from(await r2.arrayBuffer());
+        if (!looksLikeWav(buf2)) throw new Error(`Fetched URL but not WAV`);
+        const { sampleRate, channels, pcm16 } = parseWavPcm16(buf2);
+        const mono2 = channels > 1 ? stereoToMono(pcm16) : pcm16;
+        return sampleRate === targetSr ? mono2 : resamplePcm16(mono2, sampleRate, targetSr);
       }
-      if (isCompressedAudio(audioBuf)) throw new Error("Inworld returned compressed audio");
-      if (audioBuf.length % 2 === 0) return audioBuf;
-      throw new Error("Unknown audioContent encoding");
+      throw new Error("No audio found in JSON");
+    } catch (e) {
+      throw e;
     }
-    const wavBuf = findWavBase64InJson(json);
-    if (wavBuf) {
-      const { sampleRate, channels, pcm16 } = parseWavPcm16(wavBuf);
-      const mono = channels > 1 ? stereoToMono(pcm16) : pcm16;
-      return sampleRate === targetSr ? mono : resamplePcm16(mono, sampleRate, targetSr);
-    }
-    const url = extractAudioUrl(json);
-    if (url) {
-      const r2 = await fetch(url, { headers: { "Accept": "audio/wav,*/*;q=0.1" } });
-      const buf2 = Buffer.from(await r2.arrayBuffer());
-      if (!looksLikeWav(buf2)) throw new Error(`Fetched URL but not WAV`);
-      const { sampleRate, channels, pcm16 } = parseWavPcm16(buf2);
-      const mono2 = channels > 1 ? stereoToMono(pcm16) : pcm16;
-      return sampleRate === targetSr ? mono2 : resamplePcm16(mono2, sampleRate, targetSr);
-    }
-    throw new Error("No audio found in JSON");
   }
 
   if (isCompressedAudio(buf)) throw new Error("Inworld returned compressed audio");
