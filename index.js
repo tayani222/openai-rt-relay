@@ -73,7 +73,16 @@ app.get("/health", (_, res) => res.json({
 }));
 const server = http.createServer(app);
 
-const wss = new WebSocketServer({ server, path: "/ws" });
+const wss = new WebSocketServer({ noServer: true });
+server.on("upgrade", (req, socket, head) => {
+  let ok = false;
+  try {
+    const pathname = new URL(req.url, "http://local").pathname || "/";
+    if (pathname === "/ws" || pathname === "/ws/" || pathname === "/") ok = true;
+  } catch {}
+  if (!ok) { try { socket.destroy(); } catch {} return; }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
 
 wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
