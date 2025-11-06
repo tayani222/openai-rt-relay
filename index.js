@@ -32,6 +32,10 @@ const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
 const PORT = Number(process.env.PORT || 10000);
 
+const UPSTASH_URL   = process.env.UPSTASH_URL || null;
+const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN || null;
+const MEMORY_TTL_SEC = Number(process.env.MEMORY_TTL_SEC || 2592000);
+
 const GREETINGS = [
   "Oh my god, you again?!",
   "You’re such a menace!",
@@ -55,13 +59,99 @@ function isGreetingText(t) {
 
 const MAX_MEMORY_FACTS = Number(process.env.MAX_MEMORY_FACTS || 16);
 const mem = new Map();
-function getSlot(userId) { let s = mem.get(userId); if (!s) { s = { name: null, facts: [] }; mem.set(userId, s); } return s; }
-function rememberName(userId, name) { if (!name) return; const s = getSlot(userId); s.name = String(name).trim().slice(0, 80) || s.name; }
-function rememberFacts(userId, facts = []) { if (!facts.length) return; const s = getSlot(userId); for (const fRaw of facts) { const f = String(fRaw || "").replace(/\s+/g, " ").trim(); if (!f) continue; const exists = s.facts.some(x => x.toLowerCase() === f.toLowerCase()); if (!exists) { s.facts.unshift(f); if (s.facts.length > MAX_MEMORY_FACTS) s.facts.length = MAX_MEMORY_FACTS; } } }
-function getName(userId) { return getSlot(userId).name; }
-function getFacts(userId, limit = 8) { return getSlot(userId).facts.slice(0, limit); }
-function buildMemoryPreamble(name, facts) { const lines = []; if (name) lines.push(`Имя игрока: ${name}`); for (const f of facts) lines.push(`• ${f}`); if (!lines.length) return ""; return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`; }
-function compileInstr(base, userId) { const pre = buildMemoryPreamble(getName(userId), getFacts(userId, 8)); let text = pre ? `${pre}\n\n${String(base || "").trim()}` : String(base || "").trim(); if (!text) return defaultRusGuard(); return mergeRusGuard(text); }
+
+async function kvGet(key){
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
+  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  }).catch(()=>null);
+  if (!r) return null;
+  const j = await r.json().catch(()=>null);
+  return j?.result ?? null;
+}
+async function kvSet(key, val){
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  }).catch(()=>{});
+  await fetch(`${UPSTASH_URL}/expire/${encodeURIComponent(key)}/${MEMORY_TTL_SEC}`, {
+    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+  }).catch(()=>{});
+}
+
+async function getMemObj(memKey){
+  if (!memKey) return { name:null, facts:[] };
+  if (!UPSTASH_URL) {
+    return mem.get(memKey) || { name:null, facts:[] };
+  }
+  const raw = await kvGet(memKey);
+  if (!raw) return { name:null, facts:[] };
+  try { return JSON.parse(raw); } catch { return { name:null, facts:[] }; }
+}
+async function setMemObj(memKey, obj){
+  if (!memKey) return;
+  if (!UPSTASH_URL) { mem.set(memKey, obj); return; }
+  await kvSet(memKey, JSON.stringify(obj));
+}
+
+async function rememberName(memKey, name) {
+  if (!name) return;
+  const o = await getMemObj(memKey);
+  o.name = String(name).trim().slice(0,80) || o.name;
+  await setMemObj(memKey, o);
+}
+async function rememberFacts(memKey, facts = []) {
+  if (!facts || !facts.length) return;
+  const o = await getMemObj(memKey);
+  for (const fRaw of facts) {
+    const f = String(fRaw || "").replace(/\s+/g, " ").trim();
+    if (!f) continue;
+    const exists = o.facts.some(x => x.toLowerCase() === f.toLowerCase());
+    if (!exists) o.facts.unshift(f);
+  }
+  if (o.facts.length > MAX_MEMORY_FACTS) o.facts.length = MAX_MEMORY_FACTS;
+  await setMemObj(memKey, o);
+}
+async function getPlayerName(memKey) {
+  const o = await getMemObj(memKey);
+  return o.name || null;
+}
+async function getRecentFacts(memKey, limit=8) {
+  const o = await getMemObj(memKey);
+  return (o.facts || []).slice(0, limit);
+}
+
+function buildMemoryPreamble(name, facts) {
+  const lines = [];
+  if (name) lines.push(`Имя игрока: ${name}`);
+  for (const f of facts) lines.push(`• ${f}`);
+  if (!lines.length) return "";
+  return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`;
+}
+function defaultRusGuard() {
+  return ALWAYS_RU ? "Всегда отвечай и говори по‑русски." : "";
+}
+function mergeRusGuard(instr) {
+  const base = String(instr || "").trim();
+  if (!ALWAYS_RU) return base;
+  const hasRu = /русск/i.test(base);
+  return hasRu ? base : (base ? base + " " : "") + defaultRusGuard();
+}
+async function compileInstrAsync(base, memKey){
+  const name = await getPlayerName(memKey);
+  const facts = await getRecentFacts(memKey, 8);
+  const pre = buildMemoryPreamble(name, facts);
+  let out = pre ? `${pre}\n\n${String(base||"").trim()}` : String(base||"").trim();
+  if (!out) out = defaultRusGuard();
+  return mergeRusGuard(out);
+}
+
+function makeMemKey(userIdParam, npcId){
+  const raw = String(userIdParam || "").trim();
+  if (raw.length) return `user:${raw}`;
+  const n = String(npcId || "npc_default").trim();
+  return `public:${n}`;
+}
 
 const app = express();
 app.get("/", (_, res) => res.send("ok"));
@@ -69,7 +159,8 @@ app.get("/health", (_, res) => res.json({
   ok: true, useInworld: USE_INWORLD, sr: INWORLD_SR,
   chunkSamples: CHUNK_SAMPLES, prebufferMs: PREBUFFER_MS,
   earlyTts: EARLY_TTS, autoResponse: AUTO_RESPONSE, autoDelayMs: AUTO_DELAY_MS,
-  audioEventPrefix: AUDIO_EVENT_PREFIX
+  audioEventPrefix: AUDIO_EVENT_PREFIX,
+  upstash: !!UPSTASH_URL
 }));
 const server = http.createServer(app);
 
@@ -88,12 +179,14 @@ wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
-  const userId = u.searchParams.get("user_id") || `guest_${Math.random().toString(36).slice(2, 8)}`;
-  const npcId  = u.searchParams.get("npc_id")  || "npc_default";
+  const userParam = (u.searchParams.get("user_id") || "").trim();
+  const npcId  = (u.searchParams.get("npc_id")  || "npc_default").trim();
+  const userId = userParam || `guest_${Math.random().toString(36).slice(2, 8)}`;
+  const memKey = makeMemKey(userParam, npcId);
 
   const upstreamUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}${USE_INWORLD ? "" : `&voice=${encodeURIComponent(voice)}`}`;
 
-  console.log("client connected", u.search, "USE_INWORLD=", USE_INWORLD, "AUTO_RESPONSE=", AUTO_RESPONSE ? "on" : "off", "user_id=", userId, "npc_id=", npcId);
+  console.log("client connected", u.search, "USE_INWORLD=", USE_INWORLD, "AUTO_RESPONSE=", AUTO_RESPONSE ? "on" : "off", "user_id=", userId, "mem_key=", memKey);
 
   const upstream = new WebSocket(upstreamUrl, {
     headers: { Authorization: `Bearer ${OPENAI_KEY}`, "OpenAI-Beta": "realtime=v1" },
@@ -111,7 +204,7 @@ wss.on("connection", (client, req) => {
   const lastGreets = [];
   let suppressCreateUntil = 0;
 
-  client.on("message", (data, isBinary) => {
+  client.on("message", async (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
 
     if (!isBinary) {
@@ -122,7 +215,7 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "session.update" && obj.session) {
         if (typeof obj.session.instructions === "string") {
           baseInstructions = obj.session.instructions || "";
-          obj.session.instructions = compileInstr(baseInstructions, userId);
+          obj.session.instructions = await compileInstrAsync(baseInstructions, memKey);
           currentInstructions = obj.session.instructions;
         }
         upstream.send(JSON.stringify(obj), { binary: false });
@@ -207,8 +300,8 @@ wss.on("connection", (client, req) => {
                 }
               } else {
                 const { facts, player_name } = await extractFactsFromUtterance(utter).catch(() => ({ facts:[], player_name:null }));
-                if (player_name) rememberName(userId, player_name);
-                if (facts?.length) rememberFacts(userId, facts);
+                if (player_name) await rememberName(memKey, player_name);
+                if (facts?.length) await rememberFacts(memKey, facts);
               }
             }).catch(() => null);
           }
@@ -217,8 +310,8 @@ wss.on("connection", (client, req) => {
         return;
       }
 
-      if (obj?.type === "memory.set_name") { rememberName(userId, String(obj.name||"")); return; }
-      if (obj?.type === "memory.add") { rememberFacts(userId, [String(obj.fact||obj.text||"")]); return; }
+      if (obj?.type === "memory.set_name") { await rememberName(memKey, String(obj.name||"")); return; }
+      if (obj?.type === "memory.add") { await rememberFacts(memKey, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
         if (Date.now() < suppressCreateUntil) return;
@@ -233,7 +326,7 @@ wss.on("connection", (client, req) => {
         obj.response.modalities = USE_INWORLD ? ["text"] : ["audio","text"];
 
         if (obj.response.instructions) baseInstructions = obj.response.instructions;
-        obj.response.instructions = compileInstr(baseInstructions, userId);
+        obj.response.instructions = await compileInstrAsync(baseInstructions, memKey);
 
         if (generating) {
           try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {}
@@ -324,8 +417,8 @@ wss.on("connection", (client, req) => {
           pendingTranscript = null;
           if (utterance && utterance.trim()) {
             const { facts, player_name } = await extractFactsFromUtterance(utterance);
-            if (player_name) rememberName(userId, player_name);
-            if (facts?.length) rememberFacts(userId, facts);
+            if (player_name) await rememberName(memKey, player_name);
+            if (facts?.length) await rememberFacts(memKey, facts);
           }
         }
       } catch (e) {
@@ -366,14 +459,15 @@ wss.on("connection", (client, req) => {
     upstream.send(JSON.stringify({ type: "session.update", session }));
   });
 
-  function safeCreateResponse(source) {
+  async function safeCreateResponse(source) {
     if (upstream.readyState !== WebSocket.OPEN) return;
     if (Date.now() < suppressCreateUntil) return;
+    const instructions = await compileInstrAsync(baseInstructions, memKey);
     const payload = {
       type: "response.create",
       response: {
         modalities: USE_INWORLD ? ["text"] : ["audio","text"],
-        instructions: compileInstr(baseInstructions, userId)
+        instructions
       }
     };
     if (generating) {
@@ -402,16 +496,6 @@ function pickDeltaOnly(evt) {
 
 function sanitize(s){ return String(s).replace(/\s+/g, " ").trim(); }
 function isSpeakable(s){ return /[\p{L}\p{N}]/u.test(s); }
-
-function defaultRusGuard() {
-  return ALWAYS_RU ? "Всегда отвечай и говори по‑русски." : "";
-}
-function mergeRusGuard(instr) {
-  const base = String(instr || "").trim();
-  if (!ALWAYS_RU) return base;
-  const hasRu = /русск/i.test(base);
-  return hasRu ? base : (base ? base + " " : "") + defaultRusGuard();
-}
 
 function cutCompleteSentences(input, minChars = 6, hardMax = 300) {
   const t = sanitize(input);
@@ -558,7 +642,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
         const enc = (json.audioEncoding || json.encoding || json.audioConfig?.audioEncoding || "LINEAR16").toUpperCase();
         const sr  = Number(json.sampleRateHertz || json.sampleRate || json.audioConfig?.sampleRateHertz || targetSr) || targetSr;
         const ch  = Number(json.channels || json.channelCount || 1) || 1;
-        if (enc.includes("LINEAR16") || enc.includes("PCM")) {
+        if (enc.includes("LINEAR16") || (enc.includes("PCM"))) {
           const pcmRaw = ch > 1 ? stereoToMono(audioBuf) : audioBuf;
           return sr === targetSr ? pcmRaw : resamplePcm16(pcmRaw, sr, targetSr);
         }
@@ -576,7 +660,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
       if (url) {
         const r2 = await fetch(url, { headers: { "Accept": "audio/wav,*/*;q=0.1" } });
         const buf2 = Buffer.from(await r2.arrayBuffer());
-        if (!looksLikeWav(buf2)) throw new Error(`Fetched URL but not WAV`);
+        if (!looksLikeWav(buf2)) throw new Error("Fetched URL but not WAV");
         const { sampleRate, channels, pcm16 } = parseWavPcm16(buf2);
         const mono2 = channels > 1 ? stereoToMono(pcm16) : pcm16;
         return sampleRate === targetSr ? mono2 : resamplePcm16(mono2, sampleRate, targetSr);
@@ -606,7 +690,7 @@ function parseWavPcm16(buf) {
       channels = buf.readUInt16LE(pos + 10);
       sampleRate = buf.readUInt32LE(pos + 12);
       bps = buf.readUInt16LE(pos + 22);
-      if (fmt !== 1 || bps !== 16) throw new Error(`Unsupported WAV`);
+      if (fmt !== 1 || bps !== 16) throw new Error("Unsupported WAV");
     } else if (id === "data") { dataStart = pos + 8; dataLen = size; break; }
     pos += 8 + size + (size % 2);
   }
@@ -659,7 +743,7 @@ function findAudioContent(json) {
     json.result?.audioContent,
     json.media?.audioContent
   ];
-  for (const c of candidates) if (looksLikeBase64Loose(c)) return c;
+  for (const c of candidates) if(looksLikeBase64Loose(c)) return c;
   return null;
 }
 function findWavBase64InJson(json) {
