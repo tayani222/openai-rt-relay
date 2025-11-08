@@ -42,7 +42,16 @@ const DIALOG_COOLDOWN_MS = Number(process.env.DIALOG_COOLDOWN_MS || 300000);
 const IW_VOICES_FEMALE = (process.env.IW_VOICES_FEMALE || "Anastasia").split(",").map(v=>v.trim()).filter(Boolean);
 const IW_VOICES_MALE   = (process.env.IW_VOICES_MALE   || "Dmitry").split(",").map(v=>v.trim()).filter(Boolean);
 
-const GOODBYES_EN = (process.env.DIALOG_GOODBYES_EN || [
+function parseList(key, fallbackArr) {
+  const v = process.env[key];
+  if (!v || !String(v).trim()) return fallbackArr.slice();
+  return String(v)
+    .split(/\r?\n|\|/)         // по переносу строки или |
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+const GOODBYES_EN = parseList("DIALOG_GOODBYES_EN", [
   "Sorry, I've got things to do. We can talk later.",
   "That's all I can tell you for now. Good luck.",
   "It was nice talking to you, but I must be going.",
@@ -63,9 +72,13 @@ const GOODBYES_EN = (process.env.DIALOG_GOODBYES_EN || [
   "Farewell! May your path be free of unusually aggressive butterflies.",
   "I'm needed elsewhere. A great evil... has left my laundry unfolded.",
   "And with that, I shall vanish! ...Okay, I'm just going to walk away. But dramatically."
-]).flatMap(s => String(s).split(/\r?\n|\|/)).map(s=>s.trim()).filter(Boolean);
+]);
 
-const GOODBYES_RU = (process.env.DIALOG_GOODBYES_RU || "Мне нужно бежать. Поговорим позже.|Продолжим в другой раз.|Ладно, мне пора. Увидимся.").split(/\r?\n|\|/).map(s=>s.trim()).filter(Boolean);
+const GOODBYES_RU = parseList("DIALOG_GOODBYES_RU", [
+  "Мне нужно бежать. Поговорим позже.",
+  "Продолжим в другой раз.",
+  "Ладно, мне пора. Увидимся."
+]);
 
 const GREETINGS = [
   "Oh my god, you again?!",
@@ -769,3 +782,4 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   if (isCompressedAudio(buf)) throw new Error("Inworld returned compressed audio");
   throw new Error("Unexpected Inworld TTS response");
 }
+
