@@ -36,6 +36,14 @@ const UPSTASH_URL   = process.env.UPSTASH_URL || null;
 const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN || null;
 const MEMORY_TTL_SEC = Number(process.env.MEMORY_TTL_SEC || 2592000);
 
+const DIALOG_MAX_TURNS = Number(process.env.DIALOG_MAX_TURNS || 6);
+const DIALOG_COOLDOWN_MS = Number(process.env.DIALOG_COOLDOWN_MS || 300000);
+const GOODBYE_EN = process.env.DIALOG_GOODBYE_EN || "Sorry, I need to go. Catch you later.";
+const GOODBYE_RU = process.env.DIALOG_GOODBYE_RU || "Мне нужно бежать. Поговорим позже.";
+
+const IW_VOICES_FEMALE = (process.env.IW_VOICES_FEMALE || "Anastasia").split(",").map(v=>v.trim()).filter(Boolean);
+const IW_VOICES_MALE   = (process.env.IW_VOICES_MALE   || "Dmitry").split(",").map(v=>v.trim()).filter(Boolean);
+
 const GREETINGS = [
   "Oh my god, you again?!",
   "You’re such a menace!",
@@ -46,11 +54,12 @@ const GREETINGS = [
   "I swear, you need therapy.",
   "You’re crazy — and not in a cute way!"
 ];
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)] || null; }
 function pickGreeting(exclude = []) {
   const ex = new Set(exclude.map(x => String(x).trim().toLowerCase()));
   const pool = GREETINGS.filter(p => !ex.has(p.trim().toLowerCase()));
   const list = pool.length ? pool : GREETINGS;
-  return list[Math.floor(Math.random() * list.length)];
+  return pick(list);
 }
 function isGreetingText(t) {
   const s = String(t || "").toLowerCase();
@@ -62,28 +71,30 @@ const mem = new Map();
 
 async function kvGet(key){
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-  const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  }).catch(()=>null);
-  if (!r) return null;
-  const j = await r.json().catch(()=>null);
-  return j?.result ?? null;
+  try {
+    const r = await fetch(`${UPSTASH_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+    if (!r.ok) { return null; }
+    const j = await r.json().catch(()=>null);
+    return j?.result ?? null;
+  } catch{ return null; }
 }
 async function kvSet(key, val){
   if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
-  await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  }).catch(()=>{});
-  await fetch(`${UPSTASH_URL}/expire/${encodeURIComponent(key)}/${MEMORY_TTL_SEC}`, {
-    headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
-  }).catch(()=>{});
+  try {
+    await fetch(`${UPSTASH_URL}/set/${encodeURIComponent(key)}/${encodeURIComponent(val)}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+    await fetch(`${UPSTASH_URL}/expire/${encodeURIComponent(key)}/${MEMORY_TTL_SEC}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+  } catch {}
 }
 
 async function getMemObj(memKey){
   if (!memKey) return { name:null, facts:[] };
-  if (!UPSTASH_URL) {
-    return mem.get(memKey) || { name:null, facts:[] };
-  }
+  if (!UPSTASH_URL) return mem.get(memKey) || { name:null, facts:[] };
   const raw = await kvGet(memKey);
   if (!raw) return { name:null, facts:[] };
   try { return JSON.parse(raw); } catch { return { name:null, facts:[] }; }
@@ -93,7 +104,6 @@ async function setMemObj(memKey, obj){
   if (!UPSTASH_URL) { mem.set(memKey, obj); return; }
   await kvSet(memKey, JSON.stringify(obj));
 }
-
 async function rememberName(memKey, name) {
   if (!name) return;
   const o = await getMemObj(memKey);
@@ -128,9 +138,7 @@ function buildMemoryPreamble(name, facts) {
   if (!lines.length) return "";
   return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`;
 }
-function defaultRusGuard() {
-  return ALWAYS_RU ? "Всегда отвечай и говори по‑русски." : "";
-}
+function defaultRusGuard() { return ALWAYS_RU ? "Всегда отвечай и говори по‑русски." : ""; }
 function mergeRusGuard(instr) {
   const base = String(instr || "").trim();
   if (!ALWAYS_RU) return base;
@@ -145,7 +153,6 @@ async function compileInstrAsync(base, memKey){
   if (!out) out = defaultRusGuard();
   return mergeRusGuard(out);
 }
-
 function makeMemKey(userIdParam, npcId){
   const raw = String(userIdParam || "").trim();
   if (raw.length) return `user:${raw}`;
@@ -181,8 +188,16 @@ wss.on("connection", (client, req) => {
   const voice = u.searchParams.get("voice") || "verse";
   const userParam = (u.searchParams.get("user_id") || "").trim();
   const npcId  = (u.searchParams.get("npc_id")  || "npc_default").trim();
+  const langParam  = (u.searchParams.get("lang") || "").trim();
+  const iwVoiceQ   = (u.searchParams.get("iw_voice") || "").trim();
+  const gender     = (u.searchParams.get("gender") || "").toLowerCase();
+  const randVoice  = u.searchParams.get("rand_voice") === "1";
+
   const userId = userParam || `guest_${Math.random().toString(36).slice(2, 8)}`;
   const memKey = makeMemKey(userParam, npcId);
+
+  let iwLang  = langParam || INWORLD_LANG;
+  let iwVoice = iwVoiceQ || (randVoice ? (gender === "m" ? (pick(IW_VOICES_MALE) || INWORLD_VOICE) : (pick(IW_VOICES_FEMALE) || INWORLD_VOICE)) : INWORLD_VOICE);
 
   const upstreamUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}${USE_INWORLD ? "" : `&voice=${encodeURIComponent(voice)}`}`;
 
@@ -203,6 +218,29 @@ wss.on("connection", (client, req) => {
   let pendingTranscript = null;
   const lastGreets = [];
   let suppressCreateUntil = 0;
+  let turnCount = 0;
+
+  function overLimit(){ return turnCount >= DIALOG_MAX_TURNS; }
+  async function sayGoodbye() {
+    if (Date.now() < suppressCreateUntil) return;
+    const rid = `bye_${Date.now()}`;
+    const phrase = (iwLang || "").toLowerCase().startsWith("en") ? GOODBYE_EN : GOODBYE_RU;
+    if (USE_INWORLD) {
+      const parts = chunkText(phrase, CHUNK_TEXT_MAX);
+      let first = true;
+      for (const p of parts) {
+        const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
+        await streamPcm16ToClient(client, pcm, rid, undefined, 0, first);
+        first = false;
+      }
+      try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
+    } else {
+      const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
+      try { upstream.send(JSON.stringify(payload)); } catch {}
+    }
+    suppressCreateUntil = Date.now() + DIALOG_COOLDOWN_MS;
+    turnCount = 0;
+  }
 
   client.on("message", async (data, isBinary) => {
     if (upstream.readyState !== WebSocket.OPEN) return;
@@ -234,7 +272,7 @@ wss.on("connection", (client, req) => {
               const parts = chunkText(phraseClean, CHUNK_TEXT_MAX);
               let first = true;
               for (const p of parts) {
-                const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+                const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
                 await streamPcm16ToClient(client, pcm, rid, undefined, 0, first);
                 first = false;
               }
@@ -259,11 +297,14 @@ wss.on("connection", (client, req) => {
       }
 
       if (obj?.type === "input_audio_buffer.commit") {
+        if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
+        if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (AUTO_RESPONSE) {
           if (!autoTimer) {
             autoTimer = setTimeout(() => {
               autoTimer = null;
               if (Date.now() < suppressCreateUntil) return;
+              if (overLimit()) { sayGoodbye(); return; }
               safeCreateResponse("auto");
             }, AUTO_DELAY_MS);
           }
@@ -277,7 +318,6 @@ wss.on("connection", (client, req) => {
               if (isGreetingText(utter)) {
                 if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
-                suppressCreateUntil = Date.now() + 1500;
                 const phrase = pickGreeting(lastGreets);
                 const phraseClean = sanitize(phrase);
                 if (phraseClean) {
@@ -288,8 +328,8 @@ wss.on("connection", (client, req) => {
                     const parts = chunkText(phraseClean, CHUNK_TEXT_MAX);
                     let first = true;
                     for (const p of parts) {
-                      const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
-                      await streamPcm16ToClient(client, pcm, rid, undefined, 0, first);
+                      const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
+                      await streamPcm16ToClient(client, pcm2, rid, undefined, 0, first);
                       first = false;
                     }
                     try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
@@ -315,9 +355,9 @@ wss.on("connection", (client, req) => {
 
       if (obj?.type === "response.create") {
         if (Date.now() < suppressCreateUntil) return;
+        if (overLimit()) { await sayGoodbye(); return; }
         if (AUTO_RESPONSE) {
           if (obj.response?.instructions) baseInstructions = obj.response.instructions;
-          console.log("drop client response.create (AUTO_RESPONSE active)");
           return;
         }
         if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
@@ -328,10 +368,8 @@ wss.on("connection", (client, req) => {
         if (obj.response.instructions) baseInstructions = obj.response.instructions;
         obj.response.instructions = await compileInstrAsync(baseInstructions, memKey);
 
-        if (generating) {
-          try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-        }
-        console.log("send client response.create");
+        if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+        turnCount++;
         upstream.send(JSON.stringify(obj), { binary: false });
         return;
       }
@@ -405,7 +443,7 @@ wss.on("connection", (client, req) => {
               ...(tracker.itemId ? { item_id: tracker.itemId } : {}),
               output_index: tracker.outputIndex
             }));
-          }).catch(e => console.error("speakChain tail error:", e));
+          }).catch(()=>{});
         } finally {
           byRid.delete(rid);
         }
@@ -421,9 +459,7 @@ wss.on("connection", (client, req) => {
             if (facts?.length) await rememberFacts(memKey, facts);
           }
         }
-      } catch (e) {
-        console.error("memory update error:", e?.message || e);
-      }
+      } catch {}
 
       client.send(JSON.stringify(evt), { binary: false });
       return;
@@ -436,20 +472,15 @@ wss.on("connection", (client, req) => {
       if (!isSpeakable(seg)) return;
       tracker.speakChain = tracker.speakChain.then(async () => {
         try {
-          const pcm = FAKE_TONE
-            ? makeSinePcm16(900, 900, INWORLD_SR)
-            : await synthesizeWithInworld(seg, INWORLD_VOICE, INWORLD_MODEL, INWORLD_LANG, INWORLD_SR);
+          const pcm = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(seg, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
           await streamPcm16ToClient(client, pcm, rid, tracker.itemId, tracker.outputIndex, !tracker.started);
           tracker.started = true;
-        } catch (e) {
-          console.error("synth error:", e?.message || e);
-        }
-      }).catch(e => console.error("speakChain error:", e));
+        } catch {}
+      }).catch(()=>{});
     }
   });
 
   upstream.on("open", () => {
-    console.log("upstream open");
     const session = {
       modalities: USE_INWORLD ? ["text"] : ["audio","text"],
       input_audio_format: "pcm16",
@@ -462,6 +493,7 @@ wss.on("connection", (client, req) => {
   async function safeCreateResponse(source) {
     if (upstream.readyState !== WebSocket.OPEN) return;
     if (Date.now() < suppressCreateUntil) return;
+    if (overLimit()) { await sayGoodbye(); return; }
     const instructions = await compileInstrAsync(baseInstructions, memKey);
     const payload = {
       type: "response.create",
@@ -470,10 +502,8 @@ wss.on("connection", (client, req) => {
         instructions
       }
     };
-    if (generating) {
-      try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {}
-    }
-    console.log(`send ${source} response.create`);
+    if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+    turnCount++;
     try { upstream.send(JSON.stringify(payload)); } catch {}
   }
 
@@ -673,165 +703,4 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
 
   if (isCompressedAudio(buf)) throw new Error("Inworld returned compressed audio");
   throw new Error("Unexpected Inworld TTS response");
-}
-
-function looksLikeWav(buf) {
-  return buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WAVE";
-}
-function parseWavPcm16(buf) {
-  if (!looksLikeWav(buf)) throw new Error("Not a WAV file");
-  let pos = 12, sampleRate = 16000, channels = 1, bps = 16;
-  let dataStart = -1, dataLen = 0;
-  while (pos + 8 <= buf.length) {
-    const id = buf.toString("ascii", pos, pos + 4);
-    const size = buf.readUInt32LE(pos + 4);
-    if (id === "fmt ") {
-      const fmt = buf.readUInt16LE(pos + 8);
-      channels = buf.readUInt16LE(pos + 10);
-      sampleRate = buf.readUInt32LE(pos + 12);
-      bps = buf.readUInt16LE(pos + 22);
-      if (fmt !== 1 || bps !== 16) throw new Error("Unsupported WAV");
-    } else if (id === "data") { dataStart = pos + 8; dataLen = size; break; }
-    pos += 8 + size + (size % 2);
-  }
-  if (dataStart < 0) throw new Error("WAV data chunk not found");
-  return { sampleRate, channels, pcm16: buf.subarray(dataStart, dataStart + dataLen) };
-}
-function stereoToMono(pcm16){
-  const in16 = new Int16Array(pcm16.buffer, pcm16.byteOffset, pcm16.length/2);
-  const out16 = new Int16Array(in16.length/2);
-  for (let i=0,j=0; j<out16.length; i+=2, j++) out16[j] = ((in16[i]+in16[i+1])/2) | 0;
-  return Buffer.from(out16.buffer, out16.byteOffset, out16.length*2);
-}
-function resamplePcm16(pcm16, inRate, outRate){
-  if (inRate === outRate) return pcm16;
-  const in16 = new Int16Array(pcm16.buffer, pcm16.byteOffset, pcm16.length/2);
-  const ratio = outRate / inRate;
-  const outLen = Math.max(1, Math.floor(in16.length * ratio));
-  const out16 = new Int16Array(outLen);
-  for (let i=0; i<outLen; i++){
-    const src = i/ratio;
-    const s0 = Math.floor(src);
-    const s1 = Math.min(s0+1, in16.length-1);
-    const t = src - s0;
-    out16[i] = (in16[s0]*(1-t) + in16[s1]*t) | 0;
-  }
-  return Buffer.from(out16.buffer, out16.byteOffset, out16.length*2);
-}
-function isCompressedAudio(buf){
-  if (buf.length < 4) return false;
-  const a = buf[0], b = buf[1], c = buf[2], d = buf[3];
-  if (a===0x49 && b===0x44 && c===0x33) return true;
-  if (a===0xFF && (b & 0xE0) === 0xE0) return true;
-  if (String.fromCharCode(a,b,c,d) === "OggS") return true;
-  if (String.fromCharCode(a,b,c,d) === "ftyp") return true;
-  return false;
-}
-
-function looksLikeBase64Loose(s){ return typeof s === "string" && s.length > 32 && /^[A-Za-z0-9+/_=:\s-]+$/.test(s); }
-function stripDataPrefix(s){ const i = s.indexOf("base64,"); return i >= 0 ? s.slice(i + 7) : s; }
-function decodeBase64Loose(s){
-  const clean = stripDataPrefix(String(s || "").trim()).replace(/[^\w/+==\-_:]/g, "");
-  return Buffer.from(clean, "base64");
-}
-function findAudioContent(json) {
-  if (!json || typeof json !== "object") return null;
-  const candidates = [
-    json.audioContent,
-    json.audio?.content,
-    json.data?.[0]?.audioContent,
-    json.result?.audioContent,
-    json.media?.audioContent
-  ];
-  for (const c of candidates) if(looksLikeBase64Loose(c)) return c;
-  return null;
-}
-function findWavBase64InJson(json) {
-  let found = null;
-  (function scan(obj){
-    if (!obj || typeof obj !== "object" || found) return;
-    for (const k of Object.keys(obj)) {
-      const v = obj[k];
-      if (typeof v === "string" && looksLikeBase64Loose(v)) {
-        const buf = decodeBase64Loose(v);
-        if (looksLikeWav(buf)) { found = buf; return; }
-      } else if (typeof v === "object") scan(v);
-    }
-  })(json);
-  return found;
-}
-function extractAudioUrl(json) {
-  let url = null;
-  (function scan(obj){
-    if (!obj || typeof obj !== "object" || url) return;
-    for (const k of Object.keys(obj)) {
-      const v = obj[k];
-      if (typeof v === "string" && /^https?:\/\//i.test(v) && /(\.wav(\?|$)|audio\/wav)/i.test(v)) { url = v; return; }
-      else if (typeof v === "object") scan(v);
-    }
-  })(json);
-  return url;
-}
-
-function pcm16ToWav(pcm, sampleRate = INWORLD_SR, channels = 1) {
-  const byteRate = sampleRate * channels * 2;
-  const blockAlign = channels * 2;
-  const buf = Buffer.alloc(44 + pcm.length);
-  buf.write("RIFF", 0);
-  buf.writeUInt32LE(36 + pcm.length, 4);
-  buf.write("WAVE", 8);
-  buf.write("fmt ", 12);
-  buf.writeUInt32LE(16, 16);
-  buf.writeUInt16LE(1, 20);
-  buf.writeUInt16LE(channels, 22);
-  buf.writeUInt32LE(sampleRate, 24);
-  buf.writeUInt32LE(byteRate, 28);
-  buf.writeUInt16LE(blockAlign, 32);
-  buf.writeUInt16LE(16, 34);
-  buf.write("data", 36);
-  buf.writeUInt32LE(pcm.length, 40);
-  pcm.copy(buf, 44);
-  return buf;
-}
-async function transcribePCM16(pcmBuffer) {
-  if (!pcmBuffer || !pcmBuffer.length) return null;
-  const wav = pcm16ToWav(pcmBuffer, INWORLD_SR, 1);
-  const fd = new FormData();
-  fd.append("model", "gpt-4o-mini-transcribe");
-  fd.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
-  const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_KEY}` },
-    body: fd
-  });
-  if (!r.ok) return null;
-  const j = await r.json();
-  return j?.text || null;
-}
-async function extractFactsFromUtterance(utterance) {
-  if (!utterance || !utterance.trim()) return { facts: [], player_name: null };
-  const body = {
-    model: "gpt-4o-mini",
-    temperature: 0.2,
-    response_format: { type: "json_object" },
-    messages: [
-      { role: "system", content: "Извлеки устойчивые факты о пользователе из фразы. Верни JSON {facts: string[], player_name?: string}. Факты должны быть короткими и правдоподобными. Если имени нет — не указывай player_name." },
-      { role: "user", content: utterance }
-    ]
-  };
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_KEY}` },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) return { facts: [], player_name: null };
-  const j = await r.json();
-  const txt = j?.choices?.[0]?.message?.content || "{}";
-  try {
-    const parsed = JSON.parse(txt);
-    const facts = Array.isArray(parsed.facts) ? parsed.facts.slice(0, 5) : [];
-    return { facts, player_name: parsed.player_name || null };
-  } catch {
-    return { facts: [], player_name: null };
-  }
 }
