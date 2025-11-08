@@ -78,6 +78,10 @@ const GREETINGS = [
   "You’re crazy — and not in a cute way!"
 ];
 
+const TRIGGERS_JSON = process.env.TRIGGERS_JSON || null;
+let TRIGGERS = {};
+try { TRIGGERS = TRIGGERS_JSON ? JSON.parse(TRIGGERS_JSON) : {}; } catch { TRIGGERS = {}; }
+
 function pick(arr){ return arr[Math.floor(Math.random()*arr.length)] || ""; }
 function pickGoodbyeByLang(lang){
   const isEn = (lang||"").toLowerCase().startsWith("en");
@@ -92,6 +96,16 @@ function pickGreeting(exclude = []) {
 function isGreetingText(t) {
   const s = String(t || "").toLowerCase();
   return /(прив(ет)?|здравств|здоров|салют|добр(ое|ый)\s+(утро|день|вечер)|hi|hello|hey|yo|sup|hiya)/i.test(s);
+}
+function norm(s){ return String(s||"").toLowerCase(); }
+function findTrigger(npcId, text){
+  const t = norm(text);
+  const rules = (TRIGGERS[npcId] || []).concat(TRIGGERS["*"] || []);
+  for (const r of rules) {
+    const pats = (r.patterns || []).map(norm);
+    if (pats.some(p => p && t.includes(p))) return r;
+  }
+  return null;
 }
 
 const MAX_MEMORY_FACTS = Number(process.env.MAX_MEMORY_FACTS || 16);
@@ -343,6 +357,30 @@ wss.on("connection", (client, req) => {
           if (pcm.length) {
             pendingTranscript = transcribePCM16(pcm).then(async (utter) => {
               if (!utter) return;
+
+              const hit = findTrigger(npcId, utter);
+              if (hit) {
+                const phrase = hit.reply_en || hit.reply_ru || "";
+                if (phrase) {
+                  const rid = `trig_${Date.now()}`;
+                  if (USE_INWORLD) {
+                    const parts = chunkText(phrase, CHUNK_TEXT_MAX);
+                    let first = true;
+                    for (const p of parts) {
+                      const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
+                      await streamPcm16ToClient(client, pcm2, rid, undefined, 0, first);
+                      first = false;
+                    }
+                    try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, output_index: 0 })); } catch {}
+                  } else {
+                    const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
+                    try { upstream.send(JSON.stringify(payload)); } catch {}
+                  }
+                  turnCount++;
+                  return;
+                }
+              }
+
               if (isGreetingText(utter)) {
                 if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
