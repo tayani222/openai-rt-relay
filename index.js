@@ -38,11 +38,34 @@ const MEMORY_TTL_SEC = Number(process.env.MEMORY_TTL_SEC || 2592000);
 
 const DIALOG_MAX_TURNS = Number(process.env.DIALOG_MAX_TURNS || 6);
 const DIALOG_COOLDOWN_MS = Number(process.env.DIALOG_COOLDOWN_MS || 300000);
-const GOODBYE_EN = process.env.DIALOG_GOODBYE_EN || "Sorry, I need to go. Catch you later.";
-const GOODBYE_RU = process.env.DIALOG_GOODBYE_RU || "Мне нужно бежать. Поговорим позже.";
 
 const IW_VOICES_FEMALE = (process.env.IW_VOICES_FEMALE || "Anastasia").split(",").map(v=>v.trim()).filter(Boolean);
 const IW_VOICES_MALE   = (process.env.IW_VOICES_MALE   || "Dmitry").split(",").map(v=>v.trim()).filter(Boolean);
+
+const GOODBYES_EN = (process.env.DIALOG_GOODBYES_EN || [
+  "Sorry, I've got things to do. We can talk later.",
+  "That's all I can tell you for now. Good luck.",
+  "It was nice talking to you, but I must be going.",
+  "Alright, I gotta run. Take care of yourself.",
+  "I'm a bit busy at the moment. Let's catch up another time.",
+  "Well, this has been fun, but duty calls.",
+  "I've said my piece. Now, if you'll excuse me...",
+  "I'd love to chat more, but this mead won't drink itself.",
+  "Look at the time! I'm late for... something very important.",
+  "My social battery is officially drained. Farewell.",
+  "Okay, I'm off. I have to go alphabetize my cheese collection. It's a whole thing.",
+  "Was that a ghost? I have to... investigate. Goodbye!",
+  "This conversation is over. My pet rock gets anxious when I'm gone too long.",
+  "I suddenly remember I have an appointment to stare at a cloud. Fascinating stuff. Toodle-oo!",
+  "Alright, that's my cue to leave before you ask me for another fetch quest.",
+  "Oh dear, is that the time? I'm supposed to be on the other side of town ten minutes ago, yelling at birds.",
+  "I can't talk anymore. The squirrels... they're telling me it's time for dinner.",
+  "Farewell! May your path be free of unusually aggressive butterflies.",
+  "I'm needed elsewhere. A great evil... has left my laundry unfolded.",
+  "And with that, I shall vanish! ...Okay, I'm just going to walk away. But dramatically."
+]).flatMap(s => String(s).split(/\r?\n|\|/)).map(s=>s.trim()).filter(Boolean);
+
+const GOODBYES_RU = (process.env.DIALOG_GOODBYES_RU || "Мне нужно бежать. Поговорим позже.|Продолжим в другой раз.|Ладно, мне пора. Увидимся.").split(/\r?\n|\|/).map(s=>s.trim()).filter(Boolean);
 
 const GREETINGS = [
   "Oh my god, you again?!",
@@ -54,7 +77,12 @@ const GREETINGS = [
   "I swear, you need therapy.",
   "You’re crazy — and not in a cute way!"
 ];
-function pick(arr){ return arr[Math.floor(Math.random()*arr.length)] || null; }
+
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)] || ""; }
+function pickGoodbyeByLang(lang){
+  const isEn = (lang||"").toLowerCase().startsWith("en");
+  return pick(isEn ? GOODBYES_EN : GOODBYES_RU);
+}
 function pickGreeting(exclude = []) {
   const ex = new Set(exclude.map(x => String(x).trim().toLowerCase()));
   const pool = GREETINGS.filter(p => !ex.has(p.trim().toLowerCase()));
@@ -224,7 +252,7 @@ wss.on("connection", (client, req) => {
   async function sayGoodbye() {
     if (Date.now() < suppressCreateUntil) return;
     const rid = `bye_${Date.now()}`;
-    const phrase = (iwLang || "").toLowerCase().startsWith("en") ? GOODBYE_EN : GOODBYE_RU;
+    const phrase = pickGoodbyeByLang(iwLang);
     if (USE_INWORLD) {
       const parts = chunkText(phrase, CHUNK_TEXT_MAX);
       let first = true;
@@ -364,7 +392,6 @@ wss.on("connection", (client, req) => {
 
         obj.response = obj.response || {};
         obj.response.modalities = USE_INWORLD ? ["text"] : ["audio","text"];
-
         if (obj.response.instructions) baseInstructions = obj.response.instructions;
         obj.response.instructions = await compileInstrAsync(baseInstructions, memKey);
 
