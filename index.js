@@ -26,7 +26,16 @@ const EARLY_TTS     = process.env.EARLY_TTS !== "0";
 const AUTO_RESPONSE = process.env.AUTO_RESPONSE === "1";
 const AUTO_DELAY_MS = Number(process.env.AUTO_RESPONSE_DELAY_MS || 180);
 
-const ALWAYS_RU     = process.env.ALWAYS_RU !== "0";
+// Язык
+const ALWAYS_RU     = process.env.ALWAYS_RU === "1";
+const ALWAYS_EN     = process.env.ALWAYS_EN === "1";
+
+// STT
+const STT_ENABLED     = process.env.STT_ENABLED === "1";
+const STT_MODEL       = process.env.STT_MODEL || "gpt-4o-mini-transcribe";
+const STT_LANG_ENV    = (process.env.STT_LANG || "").trim(); // "en", "ru" или пусто
+const STT_TIMEOUT_MS  = Number(process.env.STT_TIMEOUT_MS || 12000);
+
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio";
 const FAKE_TONE     = process.env.FAKE_TONE === "1";
 
@@ -193,21 +202,38 @@ function buildMemoryPreamble(name, facts) {
   if (!lines.length) return "";
   return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`;
 }
-function defaultRusGuard() { return ALWAYS_RU ? "Всегда отвечай и говори по‑русски." : ""; }
-function mergeRusGuard(instr) {
+
+// ===== Языковая защита =====
+function defaultLangGuard() {
+  if (ALWAYS_EN) return "Always reply in English.";
+  if (ALWAYS_RU) return "Всегда отвечай и говори по‑русски.";
+  return "";
+}
+function hasEnglishGuard(s) {
+  const t = String(s||"").toLowerCase();
+  return /(always\s+answer|always\s+reply|reply|answer)\s+in\s+english|english\s+only|speak\s+english/i.test(t);
+}
+function hasRussianGuard(s) {
+  const t = String(s||"").toLowerCase();
+  return /(говори|отвечай).+по-русск|на\s+русском|in\s+russian|russian\s+only|speak\s+russian|по русск/i.test(t);
+}
+function mergeLangGuard(instr) {
   const base = String(instr || "").trim();
-  if (!ALWAYS_RU) return base;
-  const hasRu = /русск/i.test(base);
-  return hasRu ? base : (base ? base + " " : "") + defaultRusGuard();
+  const guard = defaultLangGuard();
+  if (!guard) return base;
+  if (ALWAYS_EN && hasEnglishGuard(base)) return base;
+  if (ALWAYS_RU && hasRussianGuard(base)) return base;
+  return base ? `${base} ${guard}` : guard;
 }
 async function compileInstrAsync(base, memKey){
   const name = await getPlayerName(memKey);
   const facts = await getRecentFacts(memKey, 8);
   const pre = buildMemoryPreamble(name, facts);
   let out = pre ? `${pre}\n\n${String(base||"").trim()}` : String(base||"").trim();
-  if (!out) out = defaultRusGuard();
-  return mergeRusGuard(out);
+  if (!out) out = defaultLangGuard();
+  return mergeLangGuard(out);
 }
+
 function makeMemKey(userIdParam, npcId){
   const raw = String(userIdParam || "").trim();
   if (raw.length) return `user:${raw}`;
@@ -222,7 +248,10 @@ app.get("/health", (_, res) => res.json({
   chunkSamples: CHUNK_SAMPLES, prebufferMs: PREBUFFER_MS,
   earlyTts: EARLY_TTS, autoResponse: AUTO_RESPONSE, autoDelayMs: AUTO_DELAY_MS,
   audioEventPrefix: AUDIO_EVENT_PREFIX,
-  upstash: !!UPSTASH_URL
+  upstash: !!UPSTASH_URL,
+  alwaysRu: ALWAYS_RU,
+  alwaysEn: ALWAYS_EN,
+  stt: STT_ENABLED, sttModel: STT_MODEL
 }));
 const server = http.createServer(app);
 
@@ -284,7 +313,6 @@ wss.on("connection", (client, req) => {
     const itemId = `${rid}_item_0`;
 
     if (USE_INWORLD) {
-      // Синтетические response события для клиента
       try {
         client.send(JSON.stringify({ type: "response.created", response: { id: rid } }));
         client.send(JSON.stringify({ type: "response.output_text.created", response_id: rid, item_id: itemId, output_index: 0 }));
@@ -391,13 +419,18 @@ wss.on("connection", (client, req) => {
           const pcm = turnPCM.length ? Buffer.concat(turnPCM) : Buffer.alloc(0);
           turnPCM = [];
           if (pcm.length) {
-            pendingTranscript = transcribePCM16(pcm).then(async (utter) => {
+            pendingTranscript = transcribePCM16(pcm, iwLang).then(async (utter) => {
               if (!utter) return;
 
               const hit = findTrigger(npcId, utter);
               if (hit) {
                 const phrase = hit.reply_en || hit.reply_ru || "";
                 if (phrase) {
+                  // Триггер имеет приоритет: гасим автогенерацию
+                  if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+                  if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+                  suppressCreateUntil = Date.now() + 1000;
+
                   const rid = `trig_${Date.now()}`;
                   const itemId = `${rid}_item_0`;
 
@@ -515,7 +548,8 @@ wss.on("connection", (client, req) => {
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
     if (type === "session.updated" && evt.session?.instructions) {
-      currentInstructions = mergeRusGuard(evt.session.instructions);
+      evt.session.instructions = mergeLangGuard(evt.session.instructions);
+      currentInstructions = evt.session.instructions;
     }
 
     if (type === "response.created" && rid) {
@@ -531,7 +565,7 @@ wss.on("connection", (client, req) => {
       activeRid = null;
     }
 
-    // ВАЖНО: Сохраняем item_id и output_index
+    // Копим текст для раннего TTS
     if (USE_INWORLD && rid && byRid.has(rid)) {
       const tracker = byRid.get(rid);
 
@@ -714,7 +748,6 @@ async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex 
   const chunkMs = Math.round(CHUNK_SAMPLES / sr * 1000);
   const burstChunks = prebufferFirst ? Math.max(0, Math.floor(PREBUFFER_MS / chunkMs)) : 0;
 
-  // Стартовое событие — важно для UE/клиентов
   try {
     client.send(JSON.stringify({
       type: `${AUDIO_EVENT_PREFIX}.start`,
@@ -764,7 +797,7 @@ function buildAuthHeader(v) {
   const raw = String(v || "").trim();
   if (!raw) return "";
   if (/^(Bearer|Basic)\s/i.test(raw)) return raw;
-  // эвристика: если строка выглядит как "user:pass" => Basic; иначе Bearer
+  // эвристика: "user:pass" => Basic; иначе Bearer
   if (raw.includes(":")) return `Basic ${raw}`;
   return `Bearer ${raw}`;
 }
@@ -866,18 +899,86 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   throw new Error("Unexpected Inworld TTS response");
 }
 
-/* ====== Minimal stubs/utilities to keep things running safely ====== */
+/* ====== STT + утилиты ====== */
 
-// 1) STT stub (верните реальную транскрибу, если нужно)
-async function transcribePCM16(pcmBuffer) {
-  // TODO: интегрировать Whisper/gpt-4o-mini-transcribe
-  return "";
+// PCM16 → WAV (mono) для STT
+function wrapPcm16ToWav(pcmBuf, sampleRate = INWORLD_SR, channels = 1) {
+  const bytesPerSample = 2;
+  const byteRate = sampleRate * channels * bytesPerSample;
+  const blockAlign = channels * bytesPerSample;
+  const dataSize = pcmBuf.length;
+  const riffSize = 36 + dataSize;
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0);
+  h.writeUInt32LE(riffSize, 4);
+  h.write("WAVE", 8);
+  h.write("fmt ", 12);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20);
+  h.writeUInt16LE(channels, 22);
+  h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(byteRate, 28);
+  h.writeUInt16LE(blockAlign, 32);
+  h.writeUInt16LE(16, 34);
+  h.write("data", 36);
+  h.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([h, pcmBuf]);
 }
 
-// 2) Примитивный извлекатель имени/фактов
+// Реальный STT через OpenAI
+async function transcribePCM16(pcmBuffer, preferLang) {
+  try {
+    if (!STT_ENABLED || !pcmBuffer || !pcmBuffer.length) return "";
+    const wav = wrapPcm16ToWav(pcmBuffer, INWORLD_SR, 1);
+
+    // Выбираем язык: ENV → ALWAYS_EN/RU → preferLang (en-US → en)
+    let lang = (STT_LANG_ENV || "").toLowerCase();
+    if (!lang) {
+      if (ALWAYS_EN) lang = "en";
+      else if (ALWAYS_RU) lang = "ru";
+      else if (preferLang) {
+        const m = String(preferLang).toLowerCase().match(/^[a-z]{2}/);
+        if (m) lang = m[0];
+      }
+    }
+
+    const form = new FormData();
+    form.append("file", new Blob([wav], { type: "audio/wav" }), "audio.wav");
+    form.append("model", STT_MODEL);
+    if (lang) form.append("language", lang);
+
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), STT_TIMEOUT_MS);
+
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}` },
+      body: form,
+      signal: ac.signal
+    }).catch((e) => {
+      console.error("STT fetch error:", e?.message || e);
+      return null;
+    });
+    clearTimeout(to);
+
+    if (!r || !r.ok) {
+      const t = r ? (await r.text().catch(()=> "")) : "";
+      console.error("STT non-OK:", r?.status, t?.slice(0, 400));
+      return "";
+    }
+    const j = await r.json().catch(() => null);
+    const text = (j?.text || "").trim();
+    return text;
+  } catch (e) {
+    console.error("STT error:", e?.message || e);
+    return "";
+  }
+}
+
+/* ====== Прочие утилиты ====== */
+
 async function extractFactsFromUtterance(text) {
   const s = String(text || "").trim();
-
   let player_name = null;
   let m = s.match(/\bменя зовут\s+([A-Za-zА-Яа-яЁё\-]{2,32})/i);
   if (m) player_name = m[1];
@@ -889,7 +990,6 @@ async function extractFactsFromUtterance(text) {
   return { facts, player_name };
 }
 
-// 3) WAV helpers
 function looksLikeWav(buf) {
   return Buffer.isBuffer(buf) &&
          buf.length >= 12 &&
@@ -962,7 +1062,6 @@ function resamplePcm16(pcm16Buf, fromSr, toSr) {
   return Buffer.from(dst.buffer);
 }
 
-// 4) JSON audio helpers
 function findAudioContent(obj) {
   if (!obj || typeof obj !== "object") return null;
   if (typeof obj.audioContent === "string") return obj.audioContent;
