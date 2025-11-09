@@ -22,18 +22,18 @@ const PREBUFFER_MS  = Number(process.env.PREBUFFER_MS  || 240);
 const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 300);
 const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 6);
 
-const EARLY_TTS     = process.env.EARLY_TTS !== "0";
+const EARLY_TTS     = process.env.EARLY_TTS !== "0"; // можно поставить 0, чтобы исключить ранний TTS модели
 const AUTO_RESPONSE = process.env.AUTO_RESPONSE === "1";
 const AUTO_DELAY_MS = Number(process.env.AUTO_RESPONSE_DELAY_MS || 180);
 
-// Язык
+// Языковые переключатели
 const ALWAYS_RU     = process.env.ALWAYS_RU === "1";
 const ALWAYS_EN     = process.env.ALWAYS_EN === "1";
 
-// STT
+// STT (Speech-to-Text)
 const STT_ENABLED     = process.env.STT_ENABLED === "1";
 const STT_MODEL       = process.env.STT_MODEL || "gpt-4o-mini-transcribe";
-const STT_LANG_ENV    = (process.env.STT_LANG || "").trim(); // "en", "ru" или пусто
+const STT_LANG_ENV    = (process.env.STT_LANG || "").trim(); // "en", "ru" или пусто (auto)
 const STT_TIMEOUT_MS  = Number(process.env.STT_TIMEOUT_MS || 12000);
 
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio";
@@ -303,6 +303,7 @@ wss.on("connection", (client, req) => {
   const lastGreets = [];
   let suppressCreateUntil = 0;
   let turnCount = 0;
+  let sttPending = false; // ВАЖНО: пока STT не закончен — не стартуем модель
 
   function overLimit(){ return turnCount >= DIALOG_MAX_TURNS; }
 
@@ -405,7 +406,9 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "input_audio_buffer.commit") {
         if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
-        if (AUTO_RESPONSE) {
+
+        // ВАЖНО: не ставим авто-таймер, если включён STT (ждём распознавания)
+        if (AUTO_RESPONSE && !STT_ENABLED) {
           if (!autoTimer) {
             autoTimer = setTimeout(() => {
               autoTimer = null;
@@ -415,18 +418,25 @@ wss.on("connection", (client, req) => {
             }, AUTO_DELAY_MS);
           }
         }
+
         try {
           const pcm = turnPCM.length ? Buffer.concat(turnPCM) : Buffer.alloc(0);
           turnPCM = [];
           if (pcm.length) {
+            if (STT_ENABLED) sttPending = true;
             pendingTranscript = transcribePCM16(pcm, iwLang).then(async (utter) => {
-              if (!utter) return;
+              sttPending = false;
+              if (!utter) {
+                // пусто — можем запустить автоответ, если он нужен
+                if (AUTO_RESPONSE && STT_ENABLED) safeCreateResponse("stt-empty");
+                return;
+              }
 
               const hit = findTrigger(npcId, utter);
               if (hit) {
                 const phrase = hit.reply_en || hit.reply_ru || "";
                 if (phrase) {
-                  // Триггер имеет приоритет: гасим автогенерацию
+                  // Триггер имеет приоритет — гасим автогенерацию
                   if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                   if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
                   suppressCreateUntil = Date.now() + 1000;
@@ -495,8 +505,15 @@ wss.on("connection", (client, req) => {
                 const { facts, player_name } = await extractFactsFromUtterance(utter).catch(() => ({ facts:[], player_name:null }));
                 if (player_name) await rememberName(memKey, player_name);
                 if (facts?.length) await rememberFacts(memKey, facts);
+
+                // Нет триггера/приветствия — только теперь запускаем модель (если надо)
+                if (AUTO_RESPONSE && STT_ENABLED) {
+                  if (Date.now() < suppressCreateUntil) return;
+                  if (overLimit()) { await sayGoodbye(); return; }
+                  safeCreateResponse("stt");
+                }
               }
-            }).catch(() => null);
+            }).catch(() => { sttPending = false; });
           }
         } catch {}
         upstream.send(JSON.stringify(obj), { binary: false });
@@ -507,6 +524,11 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "memory.add") { await rememberFacts(memKey, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
+        // Если ждём STT — игнорируем попытки стартануть модель прямо сейчас
+        if (STT_ENABLED && sttPending) {
+          if (obj.response?.instructions) baseInstructions = obj.response.instructions;
+          return;
+        }
         if (Date.now() < suppressCreateUntil) return;
         if (overLimit()) { await sayGoodbye(); return; }
         if (AUTO_RESPONSE) {
@@ -736,10 +758,6 @@ function chunkText(input, max = 300) {
   if (cur) out.push(cur);
   return out;
 }
-function logSeg(tag, rid, seg){
-  const s = seg.length > 140 ? seg.slice(0,140)+"..." : seg;
-  console.log(`[${tag}] rid=${rid} "${s}"`);
-}
 
 async function streamPcm16ToClient(client, pcm, responseId, itemId, outputIndex = 0, prebufferFirst = true) {
   const sr = INWORLD_SR;
@@ -797,7 +815,6 @@ function buildAuthHeader(v) {
   const raw = String(v || "").trim();
   if (!raw) return "";
   if (/^(Bearer|Basic)\s/i.test(raw)) return raw;
-  // эвристика: "user:pass" => Basic; иначе Bearer
   if (raw.includes(":")) return `Basic ${raw}`;
   return `Bearer ${raw}`;
 }
@@ -850,10 +867,6 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   if (ct.includes("application/json")) {
     try {
       const json = JSON.parse(buf.toString("utf8"));
-      if (json && typeof json === "object" && (json.code || json.message)) {
-        console.error("Inworld TTS error JSON:", json);
-        throw new Error(`Inworld TTS error code=${json.code} message=${json.message}`);
-      }
       const ac = findAudioContent(json);
       if (ac) {
         const audioBuf = decodeBase64Loose(ac);
@@ -865,7 +878,7 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
         const enc = (json.audioEncoding || json.encoding || json.audioConfig?.audioEncoding || "LINEAR16").toUpperCase();
         const sr  = Number(json.sampleRateHertz || json.sampleRate || json.audioConfig?.sampleRateHertz || targetSr) || targetSr;
         const ch  = Number(json.channels || json.channelCount || 1) || 1;
-        if (enc.includes("LINEAR16") || (enc.includes("PCM"))) {
+        if (enc.includes("LINEAR16") || enc.includes("PCM")) {
           const pcmRaw = ch > 1 ? stereoToMono(audioBuf) : audioBuf;
           return sr === targetSr ? pcmRaw : resamplePcm16(pcmRaw, sr, targetSr);
         }
@@ -931,7 +944,7 @@ async function transcribePCM16(pcmBuffer, preferLang) {
     if (!STT_ENABLED || !pcmBuffer || !pcmBuffer.length) return "";
     const wav = wrapPcm16ToWav(pcmBuffer, INWORLD_SR, 1);
 
-    // Выбираем язык: ENV → ALWAYS_EN/RU → preferLang (en-US → en)
+    // Язык: ENV → ALWAYS_EN/RU → preferLang (en-US → en)
     let lang = (STT_LANG_ENV || "").toLowerCase();
     if (!lang) {
       if (ALWAYS_EN) lang = "en";
