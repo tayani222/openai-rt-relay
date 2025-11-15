@@ -322,26 +322,17 @@ const onUpstreamOpen = async () => {
       .join('\n\n');
 
     // 4) применяем в Realtime (ВАЖНО: формат аудио — строкой; включаем текстовую модальность)
-    upstream.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        instructions: baseInstructions,
-        output_audio_format: "pcm16",
-        modalities: ["text"]
-      }
-    }));
+   upstream.send(JSON.stringify({
+  type: 'session.update',
+  session: {
+    instructions: baseInstructions,
+    modalities: ['text'],                     // только текст
+    turn_detection: { type: 'server_vad', create_response: false } // не автоотвечать
+  }
+}));
 
     console.log(`[reputation] Injected for ${playerIdQ}/${npcGangQ}: ${attitude} (${score})`);
-
-    // 5) (необязательно) тестовый короткий ответ сразу после подключения
-    upstream.send(JSON.stringify({
-      type: 'response.create',
-      response: {
-        conversation: 'none',
-        modalities: ['text'],
-        instructions: 'Acknowledge the player in one short sentence.'
-      }
-    }));
+ 
   } catch (e) {
     console.error('[reputation] session.update failed:', e);
   }
@@ -1202,5 +1193,6 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
 
 
