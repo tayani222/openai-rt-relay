@@ -1,3 +1,4 @@
+import { reputationManager } from './reputationManager.js';
 import "dotenv/config";
 import express from "express";
 import http from "http";
@@ -268,6 +269,8 @@ server.on("upgrade", (req, socket, head) => {
 
 wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
+const playerIdQ = u.searchParams.get('player_id') || u.searchParams.get('user_id') || `guest_${Math.random().toString(36).slice(2, 8)}`;
+const npcGangQ  = u.searchParams.get('npc_gang') || 'RedGang';
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
   const userParam = (u.searchParams.get("user_id") || "").trim();
@@ -293,6 +296,48 @@ wss.on("connection", (client, req) => {
   });
 
   let baseInstructions = "";
+ // === Reputation: inject instructions into Realtime session ===
+const onUpstreamOpen = async () => {
+  try {
+    // 1) получаем очки уважения и описание отношения
+    const score = await reputationManager.getReputation(playerIdQ, npcGangQ);
+    const attitude = reputationManager.getReputationDescription(score);
+
+    // 2) формируем инструкции для модели
+    const gangInstructions = [
+      `You are a gangster from the "${npcGangQ}" gang.`,
+      `Your current attitude towards the player is: ${attitude} (reputation score: ${score}).`,
+      `Speak briefly, in-character, like a tough gangster.`,
+      `Your gang "${npcGangQ}" is rivals with "BlueGang"; react negatively when they are mentioned.`,
+      `Base your responses on your attitude: hostile = rude and dismissive, friendly = helpful.`
+    ].join(' ');
+
+    // 3) подмешиваем к базовым инструкциям
+    const composed = [gangInstructions, baseInstructions].filter(Boolean).join('\n\n');
+    baseInstructions = composed;
+
+    // 4) отправляем обновление сессии в Realtime
+    upstream.send(JSON.stringify({
+      type: 'session.update',
+      session: { instructions: baseInstructions }
+    }));
+
+    console.log(`[reputation] Injected for ${playerIdQ}/${npcGangQ}: ${attitude} (${score})`);
+  } catch (e) {
+    console.error('[reputation] session.update failed:', e);
+  }
+};
+
+// привязываем обработчик "open" (поддержим оба варианта API)
+if (typeof upstream.on === 'function') {
+  upstream.on('open', onUpstreamOpen);
+} else if (typeof upstream.addEventListener === 'function') {
+  upstream.addEventListener('open', onUpstreamOpen);
+} else if (upstream.readyState === 1) {
+  // если соединение уже открыто — применим сразу
+  onUpstreamOpen();
+}
+// === /Reputation ===
   let currentInstructions = "";
   let autoTimer = null;
   let generating = false;
