@@ -269,8 +269,8 @@ server.on("upgrade", (req, socket, head) => {
 
 wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
-const playerIdQ = u.searchParams.get('player_id') || u.searchParams.get('user_id') || `guest_${Math.random().toString(36).slice(2, 8)}`;
-const npcGangQ  = u.searchParams.get('npc_gang') || 'RedGang';
+const playerIdQ = u.searchParams.get('player_id') || u.searchParams.get('user_id') || guest_${Math.random().toString(36).slice(2, 8)};
+const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
   const voice = u.searchParams.get("voice") || "verse";
   const userParam = (u.searchParams.get("user_id") || "").trim();
@@ -1182,3 +1182,4 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
