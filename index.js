@@ -296,47 +296,64 @@ const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
   });
 
   let baseInstructions = "";
- // === Reputation: inject instructions into Realtime session ===
+// === Reputation: inject instructions into Realtime session ===
 const onUpstreamOpen = async () => {
   try {
-    // 1) получаем очки уважения и описание отношения
+    // 1) репутация
     const score = await reputationManager.getReputation(playerIdQ, npcGangQ);
     const attitude = reputationManager.getReputationDescription(score);
 
-    // 2) формируем инструкции для модели
+    // 2) инструкции с учётом банды и уважения
     const gangInstructions = [
       `You are a gangster from the "${npcGangQ}" gang.`,
       `Your current attitude towards the player is: ${attitude} (reputation score: ${score}).`,
       `Speak briefly, in-character, like a tough gangster.`,
       `Your gang "${npcGangQ}" is rivals with "BlueGang"; react negatively when they are mentioned.`,
-      `Base your responses on your attitude: hostile = rude and dismissive, friendly = helpful.`
+      `Base your responses on your attitude: hostile = rude and dismissive, friendly = helpful.`,
+      `Always reply in English.`
     ].join(' ');
 
     // 3) подмешиваем к базовым инструкциям
-    const composed = [gangInstructions, baseInstructions].filter(Boolean).join('\n\n');
-    baseInstructions = composed;
+    baseInstructions = [gangInstructions, baseInstructions]
+      .filter(Boolean)
+      .join('\n\n');
 
-    // 4) отправляем обновление сессии в Realtime
+    // 4) применяем в Realtime (ВАЖНО: формат аудио — строкой; включаем текстовую модальность)
     upstream.send(JSON.stringify({
       type: 'session.update',
-      session: { instructions: baseInstructions }
+      session: {
+        instructions: baseInstructions,
+        output_audio_format: "pcm16",
+        modalities: ["text"]
+      }
     }));
 
     console.log(`[reputation] Injected for ${playerIdQ}/${npcGangQ}: ${attitude} (${score})`);
+
+    // 5) (необязательно) тестовый короткий ответ сразу после подключения
+    upstream.send(JSON.stringify({
+      type: 'response.create',
+      response: {
+        conversation: 'none',
+        modalities: ['text'],
+        instructions: 'Acknowledge the player in one short sentence.'
+      }
+    }));
   } catch (e) {
     console.error('[reputation] session.update failed:', e);
   }
 };
 
-// привязываем обработчик "open" (поддержим оба варианта API)
+// привязываем на открытие upstream
 if (typeof upstream.on === 'function') {
   upstream.on('open', onUpstreamOpen);
 } else if (typeof upstream.addEventListener === 'function') {
   upstream.addEventListener('open', onUpstreamOpen);
 } else if (upstream.readyState === 1) {
-  // если соединение уже открыто — применим сразу
   onUpstreamOpen();
 }
+// === /Reputation ===
+
 // === /Reputation ===
   let currentInstructions = "";
   let autoTimer = null;
