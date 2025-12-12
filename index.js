@@ -23,18 +23,16 @@ const PREBUFFER_MS  = Number(process.env.PREBUFFER_MS  || 240);
 const CHUNK_TEXT_MAX= Number(process.env.CHUNK_TEXT_MAX|| 300);
 const MIN_SENTENCE  = Number(process.env.MIN_SENTENCE_CHARS || 6);
 
-const EARLY_TTS     = process.env.EARLY_TTS !== "0"; // можно поставить 0, чтобы исключить ранний TTS модели
+const EARLY_TTS     = process.env.EARLY_TTS !== "0";
 const AUTO_RESPONSE = process.env.AUTO_RESPONSE === "1";
 const AUTO_DELAY_MS = Number(process.env.AUTO_RESPONSE_DELAY_MS || 180);
 
-// Языковые переключатели
 const ALWAYS_RU     = process.env.ALWAYS_RU === "1";
 const ALWAYS_EN     = process.env.ALWAYS_EN === "1";
 
-// STT (Speech-to-Text)
 const STT_ENABLED     = process.env.STT_ENABLED === "1";
 const STT_MODEL       = process.env.STT_MODEL || "gpt-4o-mini-transcribe";
-const STT_LANG_ENV    = (process.env.STT_LANG || "").trim(); // "en", "ru" или пусто (auto)
+const STT_LANG_ENV    = (process.env.STT_LANG || "").trim();
 const STT_TIMEOUT_MS  = Number(process.env.STT_TIMEOUT_MS || 12000);
 
 const AUDIO_EVENT_PREFIX = process.env.AUDIO_EVENT_PREFIX || "response.output_audio";
@@ -51,6 +49,34 @@ const DIALOG_COOLDOWN_MS = Number(process.env.DIALOG_COOLDOWN_MS || 300000);
 
 const IW_VOICES_FEMALE = (process.env.IW_VOICES_FEMALE || "Anastasia").split(",").map(v=>v.trim()).filter(Boolean);
 const IW_VOICES_MALE   = (process.env.IW_VOICES_MALE   || "Dmitry").split(",").map(v=>v.trim()).filter(Boolean);
+
+const MENU_HOST_INSTRUCTIONS = process.env.MENU_HOST_INSTRUCTIONS || `
+You are the friendly host of our game's main menu. Your name is Alex.
+
+ABOUT YOU:
+- You're enthusiastic, welcoming, and love talking about the game
+- You speak casually but professionally
+- You can joke around and be playful
+- You're NOT an in-game NPC - you're the "face" of the game in the menu
+
+WHAT YOU CAN DO:
+- Answer ANY questions about the game (mechanics, lore, tips, controls)
+- Give recommendations on how to start playing
+- Explain game features and modes
+- Chat casually about anything
+- Be helpful and friendly
+
+STYLE:
+- Keep responses concise but friendly (2-4 sentences usually)
+- Use casual language, can use humor
+- Be genuinely helpful
+- Always reply in English (or Russian if asked)
+
+You are NOT bound by any in-game character restrictions. Be yourself - a helpful, fun menu host!
+`;
+
+const MENU_HOST_VOICE = process.env.MENU_HOST_VOICE || "shimmer";
+const MENU_HOST_LANG = process.env.MENU_HOST_LANG || "en-US";
 
 function parseList(key, fallbackArr) {
   const v = process.env[key];
@@ -92,14 +118,22 @@ const GOODBYES_RU = parseList("DIALOG_GOODBYES_RU", [
 
 const GREETINGS = [
   "Oh my god, you again?!",
-  "You’re such a menace!",
+  "You're such a menace!",
   "Stop wrecking everything, psycho!",
   "Someone arrest this maniac already!",
-  "Ugh, you’re scaring everyone!",
-  "What’s wrong with you?!",
+  "Ugh, you're scaring everyone!",
+  "What's wrong with you?!",
   "I swear, you need therapy.",
-  "You’re crazy — and not in a cute way!"
+  "You're crazy — and not in a cute way!"
 ];
+
+const MENU_HOST_GREETINGS = parseList("MENU_HOST_GREETINGS", [
+  "Hey there! Welcome to the game! What would you like to know?",
+  "Hi! Great to see you! Ready to dive in?",
+  "Welcome back! Need any help getting started?",
+  "Hello, friend! I'm here to help you with anything!",
+  "Hey! Excited to have you here! Ask me anything!"
+]);
 
 const TRIGGERS_JSON = process.env.TRIGGERS_JSON || null;
 let TRIGGERS = {};
@@ -110,10 +144,11 @@ function pickGoodbyeByLang(lang){
   const isEn = (lang||"").toLowerCase().startsWith("en");
   return pick(isEn ? GOODBYES_EN : GOODBYES_RU);
 }
-function pickGreeting(exclude = []) {
+function pickGreeting(exclude = [], isMenuHost = false) {
+  const pool = isMenuHost ? MENU_HOST_GREETINGS : GREETINGS;
   const ex = new Set(exclude.map(x => String(x).trim().toLowerCase()));
-  const pool = GREETINGS.filter(p => !ex.has(p.trim().toLowerCase()));
-  const list = pool.length ? pool : GREETINGS;
+  const filtered = pool.filter(p => !ex.has(p.trim().toLowerCase()));
+  const list = filtered.length ? filtered : pool;
   return pick(list);
 }
 function isGreetingText(t) {
@@ -204,7 +239,6 @@ function buildMemoryPreamble(name, facts) {
   return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`;
 }
 
-// ===== Языковая защита =====
 function defaultLangGuard() {
   if (ALWAYS_EN) return "Always reply in English.";
   if (ALWAYS_RU) return "Всегда отвечай и говори по‑русски.";
@@ -269,15 +303,16 @@ server.on("upgrade", (req, socket, head) => {
 
 wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
-const playerIdQ =
-  u.searchParams.get('player_id') ||
-  u.searchParams.get('user_id') ||
-  `guest_${Math.random().toString(36).slice(2, 8)}`;
-const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
+  
+  const isMenuHost = u.searchParams.get('mode') === 'menu_host';
+  const hostName = u.searchParams.get('host_name') || 'Alex';
+  
+  const playerIdQ = u.searchParams.get('player_id') || u.searchParams.get('user_id') || `guest_${Math.random().toString(36).slice(2, 8)}`;
+  const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
   const model = u.searchParams.get("model") || "gpt-4o-realtime-preview-2024-12-17";
-  const voice = u.searchParams.get("voice") || "verse";
+  const voice = u.searchParams.get("voice") || (isMenuHost ? MENU_HOST_VOICE : "verse");
   const userParam = (u.searchParams.get("user_id") || "").trim();
-  const npcId  = (u.searchParams.get("npc_id")  || "npc_default").trim();
+  const npcId  = (u.searchParams.get("npc_id")  || (isMenuHost ? "menu_host" : "npc_default")).trim();
   const langParam  = (u.searchParams.get("lang") || "").trim();
   const iwVoiceQ   = (u.searchParams.get("iw_voice") || "").trim();
   const gender     = (u.searchParams.get("gender") || "").toLowerCase();
@@ -286,12 +321,12 @@ const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
   const userId = userParam || `guest_${Math.random().toString(36).slice(2, 8)}`;
   const memKey = makeMemKey(userParam, npcId);
 
-  let iwLang  = langParam || INWORLD_LANG;
+  let iwLang  = isMenuHost ? MENU_HOST_LANG : (langParam || INWORLD_LANG);
   let iwVoice = iwVoiceQ || (randVoice ? (gender === "m" ? (pick(IW_VOICES_MALE) || INWORLD_VOICE) : (pick(IW_VOICES_FEMALE) || INWORLD_VOICE)) : INWORLD_VOICE);
 
   const upstreamUrl = `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(model)}${USE_INWORLD ? "" : `&voice=${encodeURIComponent(voice)}`}`;
 
-  console.log("client connected", u.search, "USE_INWORLD=", USE_INWORLD, "AUTO_RESPONSE=", AUTO_RESPONSE ? "on" : "off", "user_id=", userId, "mem_key=", memKey);
+  console.log("client connected", u.search, "USE_INWORLD=", USE_INWORLD, "AUTO_RESPONSE=", AUTO_RESPONSE ? "on" : "off", "user_id=", userId, "mem_key=", memKey, "isMenuHost=", isMenuHost);
 
   const upstream = new WebSocket(upstreamUrl, {
     headers: { Authorization: `Bearer ${OPENAI_KEY}`, "OpenAI-Beta": "realtime=v1" },
@@ -299,56 +334,70 @@ const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
   });
 
   let baseInstructions = "";
-// === Reputation: inject instructions into Realtime session ===
-const onUpstreamOpen = async () => {
-  try {
-    // 1) репутация
-    const score = await reputationManager.getReputation(playerIdQ, npcGangQ);
-    const attitude = reputationManager.getReputationDescription(score);
+  
+  const onUpstreamOpen = async () => {
+    try {
+      if (isMenuHost) {
+        let menuInstructions = MENU_HOST_INSTRUCTIONS;
+        if (hostName && hostName !== 'Alex') {
+          menuInstructions = menuInstructions.replace(/Your name is Alex/gi, `Your name is ${hostName}`);
+          menuInstructions = menuInstructions.replace(/name is Alex/gi, `name is ${hostName}`);
+        }
+        
+        baseInstructions = menuInstructions;
+        
+        upstream.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            instructions: baseInstructions,
+            modalities: ['text'],
+            turn_detection: { type: 'server_vad', create_response: false }
+          }
+        }));
+        
+        console.log(`[menu_host] Connected for ${playerIdQ}, host: ${hostName}`);
+        
+      } else {
+        const score = await reputationManager.getReputation(playerIdQ, npcGangQ);
+        const attitude = reputationManager.getReputationDescription(score);
 
-    // 2) инструкции с учётом банды и уважения
-    const gangInstructions = [
-      `You are a gangster from the "${npcGangQ}" gang.`,
-      `Your current attitude towards the player is: ${attitude} (reputation score: ${score}).`,
-      `Speak briefly, in-character, like a tough gangster.`,
-      `Your gang "${npcGangQ}" is rivals with "BlueGang"; react negatively when they are mentioned.`,
-      `Base your responses on your attitude: hostile = rude and dismissive, friendly = helpful.`,
-      `Always reply in English.`
-    ].join(' ');
+        const gangInstructions = [
+          `You are a gangster from the "${npcGangQ}" gang.`,
+          `Your current attitude towards the player is: ${attitude} (reputation score: ${score}).`,
+          `Speak briefly, in-character, like a tough gangster.`,
+          `Your gang "${npcGangQ}" is rivals with "BlueGang"; react negatively when they are mentioned.`,
+          `Base your responses on your attitude: hostile = rude and dismissive, friendly = helpful.`,
+          `Always reply in English.`
+        ].join(' ');
 
-    // 3) подмешиваем к базовым инструкциям
-    baseInstructions = [gangInstructions, baseInstructions]
-      .filter(Boolean)
-      .join('\n\n');
+        baseInstructions = [gangInstructions, baseInstructions]
+          .filter(Boolean)
+          .join('\n\n');
 
-    // 4) применяем в Realtime (ВАЖНО: формат аудио — строкой; включаем текстовую модальность)
-   upstream.send(JSON.stringify({
-  type: 'session.update',
-  session: {
-    instructions: baseInstructions,
-    modalities: ['text'],                     // только текст
-    turn_detection: { type: 'server_vad', create_response: false } // не автоотвечать
+        upstream.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            instructions: baseInstructions,
+            modalities: ['text'],
+            turn_detection: { type: 'server_vad', create_response: false }
+          }
+        }));
+
+        console.log(`[reputation] Injected for ${playerIdQ}/${npcGangQ}: ${attitude} (${score})`);
+      }
+    } catch (e) {
+      console.error('[session.update] failed:', e);
+    }
+  };
+
+  if (typeof upstream.on === 'function') {
+    upstream.on('open', onUpstreamOpen);
+  } else if (typeof upstream.addEventListener === 'function') {
+    upstream.addEventListener('open', onUpstreamOpen);
+  } else if (upstream.readyState === 1) {
+    onUpstreamOpen();
   }
-}));
 
-    console.log(`[reputation] Injected for ${playerIdQ}/${npcGangQ}: ${attitude} (${score})`);
- 
-  } catch (e) {
-    console.error('[reputation] session.update failed:', e);
-  }
-};
-
-// привязываем на открытие upstream
-if (typeof upstream.on === 'function') {
-  upstream.on('open', onUpstreamOpen);
-} else if (typeof upstream.addEventListener === 'function') {
-  upstream.addEventListener('open', onUpstreamOpen);
-} else if (upstream.readyState === 1) {
-  onUpstreamOpen();
-}
-// === /Reputation ===
-
-// === /Reputation ===
   let currentInstructions = "";
   let autoTimer = null;
   let generating = false;
@@ -359,9 +408,14 @@ if (typeof upstream.on === 'function') {
   const lastGreets = [];
   let suppressCreateUntil = 0;
   let turnCount = 0;
-  let sttPending = false; // ВАЖНО: пока STT не закончен — не стартуем модель
+  let sttPending = false;
+  
+  const menuHostNoTurnLimit = isMenuHost;
 
-  function overLimit(){ return turnCount >= DIALOG_MAX_TURNS; }
+  function overLimit(){ 
+    if (menuHostNoTurnLimit) return false;
+    return turnCount >= DIALOG_MAX_TURNS; 
+  }
 
   async function sayGoodbye() {
     if (Date.now() < suppressCreateUntil) return;
@@ -412,7 +466,7 @@ if (typeof upstream.on === 'function') {
       }
 
       if (obj?.type === "relay.greet") {
-        const phrase = pickGreeting(lastGreets);
+        const phrase = pickGreeting(lastGreets, isMenuHost);
         const phraseClean = sanitize(phrase);
         if (phraseClean) {
           lastGreets.unshift(phraseClean);
@@ -463,7 +517,6 @@ if (typeof upstream.on === 'function') {
         if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
 
-        // ВАЖНО: не ставим авто-таймер, если включён STT (ждём распознавания)
         if (AUTO_RESPONSE && !STT_ENABLED) {
           if (!autoTimer) {
             autoTimer = setTimeout(() => {
@@ -483,52 +536,52 @@ if (typeof upstream.on === 'function') {
             pendingTranscript = transcribePCM16(pcm, iwLang).then(async (utter) => {
               sttPending = false;
               if (!utter) {
-                // пусто — можем запустить автоответ, если он нужен
                 if (AUTO_RESPONSE && STT_ENABLED) safeCreateResponse("stt-empty");
                 return;
               }
 
-              const hit = findTrigger(npcId, utter);
-              if (hit) {
-                const phrase = hit.reply_en || hit.reply_ru || "";
-                if (phrase) {
-                  // Триггер имеет приоритет — гасим автогенерацию
-                  if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-                  if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
-                  suppressCreateUntil = Date.now() + 1000;
+              if (!isMenuHost) {
+                const hit = findTrigger(npcId, utter);
+                if (hit) {
+                  const phrase = hit.reply_en || hit.reply_ru || "";
+                  if (phrase) {
+                    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+                    if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+                    suppressCreateUntil = Date.now() + 1000;
 
-                  const rid = `trig_${Date.now()}`;
-                  const itemId = `${rid}_item_0`;
+                    const rid = `trig_${Date.now()}`;
+                    const itemId = `${rid}_item_0`;
 
-                  if (USE_INWORLD) {
-                    try {
-                      client.send(JSON.stringify({ type: "response.created", response: { id: rid } }));
-                      client.send(JSON.stringify({ type: "response.output_text.created", response_id: rid, item_id: itemId, output_index: 0 }));
-                      client.send(JSON.stringify({ type: "response.output_text.delta", response_id: rid, item_id: itemId, output_index: 0, delta: phrase }));
-                      client.send(JSON.stringify({ type: "response.output_text.done", response_id: rid, item_id: itemId, output_index: 0 }));
-                    } catch {}
+                    if (USE_INWORLD) {
+                      try {
+                        client.send(JSON.stringify({ type: "response.created", response: { id: rid } }));
+                        client.send(JSON.stringify({ type: "response.output_text.created", response_id: rid, item_id: itemId, output_index: 0 }));
+                        client.send(JSON.stringify({ type: "response.output_text.delta", response_id: rid, item_id: itemId, output_index: 0, delta: phrase }));
+                        client.send(JSON.stringify({ type: "response.output_text.done", response_id: rid, item_id: itemId, output_index: 0 }));
+                      } catch {}
 
-                    const parts = chunkText(phrase, CHUNK_TEXT_MAX);
-                    let first = true;
-                    for (const p of parts) {
-                      const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
-                      await streamPcm16ToClient(client, pcm2, rid, itemId, 0, first);
-                      first = false;
+                      const parts = chunkText(phrase, CHUNK_TEXT_MAX);
+                      let first = true;
+                      for (const p of parts) {
+                        const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
+                        await streamPcm16ToClient(client, pcm2, rid, itemId, 0, first);
+                        first = false;
+                      }
+                      try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, item_id: itemId, output_index: 0 })); } catch {}
+                    } else {
+                      const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
+                      try { upstream.send(JSON.stringify(payload)); } catch {}
                     }
-                    try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, item_id: itemId, output_index: 0 })); } catch {}
-                  } else {
-                    const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
-                    try { upstream.send(JSON.stringify(payload)); } catch {}
+                    turnCount++;
+                    return;
                   }
-                  turnCount++;
-                  return;
                 }
               }
 
               if (isGreetingText(utter)) {
                 if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
-                const phrase = pickGreeting(lastGreets);
+                const phrase = pickGreeting(lastGreets, isMenuHost);
                 const phraseClean = sanitize(phrase);
                 if (phraseClean) {
                   lastGreets.unshift(phraseClean);
@@ -562,7 +615,6 @@ if (typeof upstream.on === 'function') {
                 if (player_name) await rememberName(memKey, player_name);
                 if (facts?.length) await rememberFacts(memKey, facts);
 
-                // Нет триггера/приветствия — только теперь запускаем модель (если надо)
                 if (AUTO_RESPONSE && STT_ENABLED) {
                   if (Date.now() < suppressCreateUntil) return;
                   if (overLimit()) { await sayGoodbye(); return; }
@@ -580,7 +632,6 @@ if (typeof upstream.on === 'function') {
       if (obj?.type === "memory.add") { await rememberFacts(memKey, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
-        // Если ждём STT — игнорируем попытки стартануть модель прямо сейчас
         if (STT_ENABLED && sttPending) {
           if (obj.response?.instructions) baseInstructions = obj.response.instructions;
           return;
@@ -622,7 +673,6 @@ if (typeof upstream.on === 'function') {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
-    // Не форвардим аудио от OpenAI, если юзаем Inworld
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
     if (type === "session.updated" && evt.session?.instructions) {
@@ -643,7 +693,6 @@ if (typeof upstream.on === 'function') {
       activeRid = null;
     }
 
-    // Копим текст для раннего TTS
     if (USE_INWORLD && rid && byRid.has(rid)) {
       const tracker = byRid.get(rid);
 
@@ -968,9 +1017,6 @@ async function synthesizeWithInworld(text, voiceId, modelId, lang, targetSr = 16
   throw new Error("Unexpected Inworld TTS response");
 }
 
-/* ====== STT + утилиты ====== */
-
-// PCM16 → WAV (mono) для STT
 function wrapPcm16ToWav(pcmBuf, sampleRate = INWORLD_SR, channels = 1) {
   const bytesPerSample = 2;
   const byteRate = sampleRate * channels * bytesPerSample;
@@ -994,13 +1040,11 @@ function wrapPcm16ToWav(pcmBuf, sampleRate = INWORLD_SR, channels = 1) {
   return Buffer.concat([h, pcmBuf]);
 }
 
-// Реальный STT через OpenAI
 async function transcribePCM16(pcmBuffer, preferLang) {
   try {
     if (!STT_ENABLED || !pcmBuffer || !pcmBuffer.length) return "";
     const wav = wrapPcm16ToWav(pcmBuffer, INWORLD_SR, 1);
 
-    // Язык: ENV → ALWAYS_EN/RU → preferLang (en-US → en)
     let lang = (STT_LANG_ENV || "").toLowerCase();
     if (!lang) {
       if (ALWAYS_EN) lang = "en";
@@ -1043,8 +1087,6 @@ async function transcribePCM16(pcmBuffer, preferLang) {
     return "";
   }
 }
-
-/* ====== Прочие утилиты ====== */
 
 async function extractFactsFromUtterance(text) {
   const s = String(text || "").trim();
@@ -1153,11 +1195,11 @@ function isCompressedAudio(buf) {
   if (!Buffer.isBuffer(buf) || buf.length < 4) return false;
   const sig4 = buf.toString("ascii", 0, 4);
   const b0 = buf[0], b1 = buf[1];
-  if (sig4 === "OggS") return true;      // OGG/Opus
-  if (sig4 === "fLaC") return true;      // FLAC
-  if (sig4 === "ID3 ") return true;      // MP3 ID3
-  if (b0 === 0xFF && (b1 & 0xE0) === 0xE0) return true; // MP3 frame
-  if (sig4 === "RIFF" && buf.toString("ascii", 8, 12) !== "WAVE") return true; // non-WAVE RIFF
+  if (sig4 === "OggS") return true;
+  if (sig4 === "fLaC") return true;
+  if (sig4 === "ID3 ") return true;
+  if (b0 === 0xFF && (b1 & 0xE0) === 0xE0) return true;
+  if (sig4 === "RIFF" && buf.toString("ascii", 8, 12) !== "WAVE") return true;
   return false;
 }
 
@@ -1193,6 +1235,3 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
-
-
-
