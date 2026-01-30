@@ -51,28 +51,43 @@ const IW_VOICES_FEMALE = (process.env.IW_VOICES_FEMALE || "Anastasia").split(","
 const IW_VOICES_MALE   = (process.env.IW_VOICES_MALE   || "Dmitry").split(",").map(v=>v.trim()).filter(Boolean);
 
 const MENU_HOST_INSTRUCTIONS = process.env.MENU_HOST_INSTRUCTIONS || `
-You are the friendly host of our game's main menu. Your name is Alex.
+You are Maya, the official host and guide of RaceOnLife.
+
+YOUR PERSONALITY:
+- You are friendly, talkative, and love sharing details
+- You speak with enthusiasm and passion about the game
+- You give FULL, DETAILED answers - never one-word responses
+- When asked your name, introduce yourself properly with personality
+- When asked about the game, give rich descriptions
 
 ABOUT YOU:
-- You're enthusiastic, welcoming, and love talking about the game
-- You speak casually but professionally
-- You can joke around and be playful
-- You're NOT an in-game NPC - you're the "face" of the game in the menu
+- Your name is Maya
+- You live in Solanos and know everything about the island
+- You're excited to help new players discover the world
+- You have a bit of street attitude but you're welcoming
 
-WHAT YOU CAN DO:
-- Answer ANY questions about the game (mechanics, lore, tips, controls)
-- Give recommendations on how to start playing
-- Explain game features and modes
-- Chat casually about anything
-- Be helpful and friendly
+WHEN ASKED YOUR NAME:
+Say something like: "I'm Maya! I'm your guide to Solanos - the craziest island you'll ever set foot on. I know every street, every racer, every underground fight club. What do you want to know?"
 
-STYLE:
-- Keep responses concise but friendly (2-4 sentences usually)
-- Use casual language, can use humor
-- Be genuinely helpful
-- Always reply in English (or Russian if asked)
+WHEN ASKED ABOUT THE GAME:
+Give the full exciting pitch about RaceOnLife - the open world, the AI NPCs with memory, the racing, fighting, derby modes, the reputation system, everything!
 
-You are NOT bound by any in-game character restrictions. Be yourself - a helpful, fun menu host!
+GAME INFO:
+- RaceOnLife is an open-world racing MMORPG set on Solanos island
+- Lawless paradise where power belongs to those who grip the wheel
+- AI NPCs remember your actions and spread the word
+- Modes: Racing, Underground Fights, Derby, PvE missions, PvP battles
+- No replay button - every decision is permanent
+- Tagline: Drive or Die
+
+RESPONSE STYLE:
+- Give DETAILED answers, minimum 2-3 sentences
+- Show personality and enthusiasm
+- Use vivid descriptions
+- Never give boring one-word answers
+- If someone asks a simple question, still make it interesting
+
+Always reply in English unless asked otherwise.
 `;
 
 const MENU_HOST_VOICE = process.env.MENU_HOST_VOICE || "shimmer";
@@ -128,11 +143,11 @@ const GREETINGS = [
 ];
 
 const MENU_HOST_GREETINGS = parseList("MENU_HOST_GREETINGS", [
-  "Hey there! Welcome to the game! What would you like to know?",
-  "Hi! Great to see you! Ready to dive in?",
-  "Welcome back! Need any help getting started?",
-  "Hello, friend! I'm here to help you with anything!",
-  "Hey! Excited to have you here! Ask me anything!"
+  "Hey there! Welcome to Solanos! I'm Maya, your guide to the craziest island you'll ever see. What do you want to know about RaceOnLife?",
+  "Welcome, racer! I'm Maya - I know every street, every underground fight club, every secret on this island. Ask me anything!",
+  "Hey! You made it to Solanos! I'm Maya, and I'm here to tell you everything about RaceOnLife. Ready to dive in?",
+  "Oh, fresh blood! Welcome! I'm Maya - think of me as your personal guide to chaos. What's on your mind?",
+  "Drive or Die - that's the motto here! I'm Maya, welcome to RaceOnLife. What would you like to know?"
 ]);
 
 const TRIGGERS_JSON = process.env.TRIGGERS_JSON || null;
@@ -233,10 +248,10 @@ async function getRecentFacts(memKey, limit=8) {
 
 function buildMemoryPreamble(name, facts) {
   const lines = [];
-  if (name) lines.push(`Имя игрока: ${name}`);
+  if (name) lines.push(`Player name: ${name}`);
   for (const f of facts) lines.push(`• ${f}`);
   if (!lines.length) return "";
-  return `Контекст о игроке (память):\n${lines.join("\n")}\nИспользуй этот контекст уместно и ненавязчиво.`;
+  return `Context about the player (memory):\n${lines.join("\n")}\nUse this context naturally in conversation.`;
 }
 
 function defaultLangGuard() {
@@ -305,7 +320,7 @@ wss.on("connection", (client, req) => {
   const u = new URL(req.url, "http://local");
   
   const isMenuHost = u.searchParams.get('mode') === 'menu_host';
-  const hostName = u.searchParams.get('host_name') || 'Alex';
+  const hostName = u.searchParams.get('host_name') || 'Maya';
   
   const playerIdQ = u.searchParams.get('player_id') || u.searchParams.get('user_id') || `guest_${Math.random().toString(36).slice(2, 8)}`;
   const npcGangQ = u.searchParams.get('npc_gang') || 'RedGang';
@@ -339,9 +354,10 @@ wss.on("connection", (client, req) => {
     try {
       if (isMenuHost) {
         let menuInstructions = MENU_HOST_INSTRUCTIONS;
-        if (hostName && hostName !== 'Alex') {
-          menuInstructions = menuInstructions.replace(/Your name is Alex/gi, `Your name is ${hostName}`);
-          menuInstructions = menuInstructions.replace(/name is Alex/gi, `name is ${hostName}`);
+        if (hostName && hostName !== 'Maya') {
+          menuInstructions = menuInstructions.replace(/Maya/g, hostName);
+          menuInstructions = menuInstructions.replace(/Your name is Maya/gi, `Your name is ${hostName}`);
+          menuInstructions = menuInstructions.replace(/I'm Maya/gi, `I'm ${hostName}`);
         }
         
         baseInstructions = menuInstructions;
@@ -350,8 +366,16 @@ wss.on("connection", (client, req) => {
           type: 'session.update',
           session: {
             instructions: baseInstructions,
-            modalities: ['text'],
-            turn_detection: { type: 'server_vad', create_response: false }
+            modalities: ['text', 'audio'],
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            turn_detection: { 
+              type: 'server_vad',
+              threshold: 0.5,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 500,
+              create_response: true
+            }
           }
         }));
         
@@ -514,6 +538,11 @@ wss.on("connection", (client, req) => {
       }
 
       if (obj?.type === "input_audio_buffer.commit") {
+        if (isMenuHost) {
+          upstream.send(JSON.stringify(obj), { binary: false });
+          return;
+        }
+        
         if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
 
@@ -578,7 +607,7 @@ wss.on("connection", (client, req) => {
                 }
               }
 
-              if (isGreetingText(utter)) {
+              if (isGreetingText(utter) && !isMenuHost) {
                 if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
                 const phrase = pickGreeting(lastGreets, isMenuHost);
@@ -632,6 +661,11 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "memory.add") { await rememberFacts(memKey, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
+        if (isMenuHost) {
+          upstream.send(JSON.stringify(obj), { binary: false });
+          return;
+        }
+        
         if (STT_ENABLED && sttPending) {
           if (obj.response?.instructions) baseInstructions = obj.response.instructions;
           return;
