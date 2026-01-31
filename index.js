@@ -781,6 +781,11 @@ wss.on("connection", (client, req) => {
     // ===== ЛОГИРУЕМ ВСЕ СООБЩЕНИЯ ОТ OPENAI =====
     console.log(`[upstream MSG] type=${type}`, rid ? `rid=${rid}` : "", isMenuHost ? "(MenuHost)" : "(GameNPC)");
 
+// Логируем полное содержимое для response событий
+if (type.includes("response") && isMenuHost) {
+  console.log(`[upstream FULL]`, JSON.stringify(evt).slice(0, 500));
+}
+
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
     if (type === "session.updated" && evt.session?.instructions) {
@@ -1392,6 +1397,7 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
 
 
 
