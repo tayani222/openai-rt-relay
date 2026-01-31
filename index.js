@@ -590,23 +590,30 @@ wss.on("connection", (client, req) => {
       }
 
       if (obj?.type === "input_audio_buffer.append") {
-        const b64 = obj.audio || obj.delta || "";
-        if (b64 && typeof b64 === "string") {
-          try {
+    const b64 = obj.audio || obj.delta || "";
+    if (b64 && typeof b64 === "string") {
+        try {
             const cleaned = b64.replace(/[^A-Za-z0-9+/=]/g, "");
-            turnPCM.push(Buffer.from(cleaned, "base64"));
-          } catch {}
-        }
-        upstream.send(JSON.stringify(obj), { binary: false });
-        return;
-      }
+            const buf = Buffer.from(cleaned, "base64");
+            turnPCM.push(buf);
+            console.log(`[append] isMenuHost=${isMenuHost}, chunk=${buf.length} bytes, total=${turnPCM.length} chunks`);
+        } catch {}
+    }
+    upstream.send(JSON.stringify(obj), { binary: false });
+    return;
+}
 
       if (obj?.type === "input_audio_buffer.commit") {
-        // MenuHost: просто пробрасываем, Realtime API сам обработает
-        if (isMenuHost) {
-          upstream.send(JSON.stringify(obj), { binary: false });
-          return;
-        }
+    console.log(`[commit] isMenuHost=${isMenuHost}, turnPCM.length=${turnPCM.length}, totalBytes=${turnPCM.reduce((a,b)=>a+b.length,0)}`);
+    
+    // MenuHost: просто пробрасываем, Realtime API сам обработает
+    if (isMenuHost) {
+        console.log(`[commit] MenuHost: forwarding to upstream`);
+        upstream.send(JSON.stringify(obj), { binary: false });
+        return;
+    }
+
+    // ... остальной код остаётся как есть
 
         if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
@@ -1336,3 +1343,4 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
