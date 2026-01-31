@@ -778,14 +778,23 @@ wss.on("connection", (client, req) => {
     const type = evt?.type || "";
     const rid  = evt.response_id || evt.response?.id || evt?.event?.response?.id || null;
 
+    // ===== ЛОГИРУЕМ ВСЕ СООБЩЕНИЯ ОТ OPENAI =====
+    console.log(`[upstream MSG] type=${type}`, rid ? `rid=${rid}` : "", isMenuHost ? "(MenuHost)" : "(GameNPC)");
+
     if (USE_INWORLD && /^response\.(output_)?audio\./.test(type)) return;
 
     if (type === "session.updated" && evt.session?.instructions) {
+      console.log(`[upstream MSG] Session updated successfully`);
       evt.session.instructions = mergeLangGuard(evt.session.instructions);
       currentInstructions = evt.session.instructions;
     }
 
+    if (type === "error") {
+      console.error(`[upstream ERROR]`, JSON.stringify(evt.error || evt));
+    }
+
     if (type === "response.created" && rid) {
+      console.log(`[upstream MSG] Response created: ${rid}`);
       generating = true;
       activeRid = rid;
       if (USE_INWORLD && !byRid.has(rid)) {
@@ -794,6 +803,7 @@ wss.on("connection", (client, req) => {
     }
 
     if (type === "response.error") {
+      console.error(`[upstream MSG] Response error:`, JSON.stringify(evt.error || evt));
       generating = false;
       activeRid = null;
     }
@@ -816,6 +826,7 @@ wss.on("connection", (client, req) => {
     }
 
     if (rid && (type === "response.done" || type === "response.completed")) {
+      console.log(`[upstream MSG] Response done: ${rid}`);
       generating = false;
       if (activeRid === rid) activeRid = null;
 
@@ -873,6 +884,8 @@ wss.on("connection", (client, req) => {
       }).catch(()=>{});
     }
   });
+
+    
 
   upstream.on("open", () => {
     console.log(`[upstream] ===== WebSocket OPENED to OpenAI =====`);
@@ -1379,6 +1392,7 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
 
 
 
