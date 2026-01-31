@@ -875,14 +875,25 @@ wss.on("connection", (client, req) => {
   });
 
   upstream.on("open", () => {
+    console.log(`[upstream] ===== WebSocket OPENED to OpenAI =====`);
+    console.log(`[upstream] isMenuHost=${isMenuHost}, model=${model}`);
     const session = {
       modalities: USE_INWORLD ? ["text"] : ["audio","text"],
       input_audio_format: "pcm16",
       output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
     };
     if (!USE_INWORLD) session.voice = voice;
+    console.log(`[upstream] Sending session.update:`, JSON.stringify(session).slice(0, 200));
     upstream.send(JSON.stringify({ type: "session.update", session }));
-  });
+});
+
+upstream.on("error", (e) => {
+    console.error(`[upstream] ===== WebSocket ERROR =====`, e?.message || e);
+});
+
+upstream.on("close", (code, reason) => {
+    console.log(`[upstream] ===== WebSocket CLOSED ===== code=${code}, reason=${reason}`);
+});
 
   async function safeCreateResponse(source) {
     if (upstream.readyState !== WebSocket.OPEN) return;
@@ -1343,4 +1354,5 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
 
