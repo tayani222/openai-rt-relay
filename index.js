@@ -877,14 +877,39 @@ wss.on("connection", (client, req) => {
   upstream.on("open", () => {
     console.log(`[upstream] ===== WebSocket OPENED to OpenAI =====`);
     console.log(`[upstream] isMenuHost=${isMenuHost}, model=${model}`);
-    const session = {
-      modalities: USE_INWORLD ? ["text"] : ["audio","text"],
-      input_audio_format: "pcm16",
-      output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
-    };
-    if (!USE_INWORLD) session.voice = voice;
-    console.log(`[upstream] Sending session.update:`, JSON.stringify(session).slice(0, 200));
-    upstream.send(JSON.stringify({ type: "session.update", session }));
+    
+    if (isMenuHost) {
+        // MenuHost: аудио + текст, VAD на стороне OpenAI
+        const menuSession = {
+            type: 'session.update',
+            session: {
+                instructions: MENU_HOST_INSTRUCTIONS,
+                modalities: ['text', 'audio'],
+                input_audio_format: 'pcm16',
+                output_audio_format: 'pcm16',
+                turn_detection: { 
+                    type: 'server_vad',
+                    threshold: 0.5,
+                    prefix_padding_ms: 300,
+                    silence_duration_ms: 500,
+                    create_response: true
+                }
+            }
+        };
+        console.log(`[upstream] MenuHost: Sending session with audio+text modalities`);
+        upstream.send(JSON.stringify(menuSession));
+        console.log(`[menu_host] Connected for ${playerIdQ}, host: ${hostName}`);
+    } else {
+        // GameNPC: только текст
+        const session = {
+            modalities: USE_INWORLD ? ["text"] : ["audio","text"],
+            input_audio_format: "pcm16",
+            output_audio_format: { type: "pcm16", sample_rate: INWORLD_SR, channels: 1 }
+        };
+        if (!USE_INWORLD) session.voice = voice;
+        console.log(`[upstream] GameNPC: Sending session.update:`, JSON.stringify(session).slice(0, 200));
+        upstream.send(JSON.stringify({ type: "session.update", session }));
+    }
 });
 
 upstream.on("error", (e) => {
@@ -1354,5 +1379,6 @@ function extractAudioUrl(obj) {
   walk(obj);
   return out;
 }
+
 
 
