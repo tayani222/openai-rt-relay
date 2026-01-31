@@ -602,11 +602,12 @@ wss.on("connection", (client, req) => {
       }
 
       if (obj?.type === "input_audio_buffer.commit") {
+        // MenuHost: просто пробрасываем, Realtime API сам обработает
         if (isMenuHost) {
           upstream.send(JSON.stringify(obj), { binary: false });
           return;
         }
-        
+
         if (Date.now() < suppressCreateUntil) { upstream.send(JSON.stringify(obj), { binary:false }); return; }
         if (overLimit()) { await sayGoodbye(); upstream.send(JSON.stringify(obj), { binary:false }); return; }
 
@@ -633,48 +634,46 @@ wss.on("connection", (client, req) => {
                 return;
               }
 
-              if (!isMenuHost) {
-                const hit = findTrigger(npcId, utter);
-                if (hit) {
-                  const phrase = hit.reply_en || hit.reply_ru || "";
-                  if (phrase) {
-                    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-                    if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
-                    suppressCreateUntil = Date.now() + 1000;
+              const hit = findTrigger(npcId, utter);
+              if (hit) {
+                const phrase = hit.reply_en || hit.reply_ru || "";
+                if (phrase) {
+                  if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+                  if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
+                  suppressCreateUntil = Date.now() + 1000;
 
-                    const rid = `trig_${Date.now()}`;
-                    const itemId = `${rid}_item_0`;
+                  const rid = `trig_${Date.now()}`;
+                  const itemId = `${rid}_item_0`;
 
-                    if (USE_INWORLD) {
-                      try {
-                        client.send(JSON.stringify({ type: "response.created", response: { id: rid } }));
-                        client.send(JSON.stringify({ type: "response.output_text.created", response_id: rid, item_id: itemId, output_index: 0 }));
-                        client.send(JSON.stringify({ type: "response.output_text.delta", response_id: rid, item_id: itemId, output_index: 0, delta: phrase }));
-                        client.send(JSON.stringify({ type: "response.output_text.done", response_id: rid, item_id: itemId, output_index: 0 }));
-                      } catch {}
+                  if (USE_INWORLD) {
+                    try {
+                      client.send(JSON.stringify({ type: "response.created", response: { id: rid } }));
+                      client.send(JSON.stringify({ type: "response.output_text.created", response_id: rid, item_id: itemId, output_index: 0 }));
+                      client.send(JSON.stringify({ type: "response.output_text.delta", response_id: rid, item_id: itemId, output_index: 0, delta: phrase }));
+                      client.send(JSON.stringify({ type: "response.output_text.done", response_id: rid, item_id: itemId, output_index: 0 }));
+                    } catch {}
 
-                      const parts = chunkText(phrase, CHUNK_TEXT_MAX);
-                      let first = true;
-                      for (const p of parts) {
-                        const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
-                        await streamPcm16ToClient(client, pcm2, rid, itemId, 0, first);
-                        first = false;
-                      }
-                      try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, item_id: itemId, output_index: 0 })); } catch {}
-                    } else {
-                      const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
-                      try { upstream.send(JSON.stringify(payload)); } catch {}
+                    const parts = chunkText(phrase, CHUNK_TEXT_MAX);
+                    let first = true;
+                    for (const p of parts) {
+                      const pcm2 = FAKE_TONE ? makeSinePcm16(900,900,INWORLD_SR) : await synthesizeWithInworld(p, iwVoice, INWORLD_MODEL, iwLang, INWORLD_SR);
+                      await streamPcm16ToClient(client, pcm2, rid, itemId, 0, first);
+                      first = false;
                     }
-                    turnCount++;
-                    return;
+                    try { client.send(JSON.stringify({ type: `${AUDIO_EVENT_PREFIX}.done`, response_id: rid, item_id: itemId, output_index: 0 })); } catch {}
+                  } else {
+                    const payload = { type: "response.create", response: { modalities: ["audio","text"], instructions: `Say exactly this line and nothing else: ${phrase}` } };
+                    try { upstream.send(JSON.stringify(payload)); } catch {}
                   }
+                  turnCount++;
+                  return;
                 }
               }
 
-              if (isGreetingText(utter) && !isMenuHost) {
+              if (isGreetingText(utter)) {
                 if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 if (generating) { try { upstream.send(JSON.stringify({ type: "response.cancel" })); } catch {} }
-                const phrase = pickGreeting(lastGreets, isMenuHost);
+                const phrase = pickGreeting(lastGreets, false);
                 const phraseClean = sanitize(phrase);
                 if (phraseClean) {
                   lastGreets.unshift(phraseClean);
@@ -725,6 +724,7 @@ wss.on("connection", (client, req) => {
       if (obj?.type === "memory.add") { await rememberFacts(memKey, [String(obj.fact||obj.text||"")]); return; }
 
       if (obj?.type === "response.create") {
+        // MenuHost: пробрасываем напрямую, сервер сам обрабатывает
         if (isMenuHost) {
           upstream.send(JSON.stringify(obj), { binary: false });
           return;
